@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+quiz.db
+quiz.db-shm
+quiz.db-wal
+server.log
