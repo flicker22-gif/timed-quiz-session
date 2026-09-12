@@ -106,6 +106,18 @@ with db() as conn:
     n = conn.execute("SELECT COUNT(*) c FROM attempts WHERE exam_id=?", (exam2["exam_id"],)).fetchone()["c"]
 check("超时场景也只有一条记录", n == 1)
 
+# ---------- 场景3: 未开始的考试不能被"强制超时收卷" ----------
+exam3 = make_exam(client, students=("赵六",))
+tok3 = token_of(exam3, "赵六")
+c = app.test_client()
+r = c.post(f"/api/s/{tok3}/submit", json={"answers": {"q1": 0}})  # 从未打开页面直接交卷
+check("未开始时交卷被拒绝(409)", r.status_code == 409 and r.get_json().get("status") == "not_started",
+      f"{r.status_code} {r.get_json()}")
+s = c.get(f"/api/s/{tok3}/state").get_json()
+check("之后首次打开仍能正常开考", s["status"] == "in_progress" and s["remaining_seconds"] > 0, str(s["status"]))
+r = c.post(f"/api/s/{tok3}/submit", json={"answers": {"q1": 1, "q2": 1}}).get_json()
+check("开考后正常交卷判分(2分)", r.get("status") == "submitted" and r.get("score") == 2, str(r))
+
 print()
 failed = [n for n, ok, _ in results if not ok]
 print(f"共 {len(results)} 项检查, 通过 {len(results) - len(failed)}, 失败 {len(failed)}")

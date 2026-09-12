@@ -249,6 +249,9 @@ def submit(token):
             return jsonify(
                 ok=True, duplicate=True, status=attempt["status"], score=attempt["score"]
             )
+        if attempt["status"] == "not_started":
+            # 未打开过答题页就没有计时, 不允许交卷; 否则持链接者可把未开始的卷子直接作废
+            return jsonify(ok=False, status="not_started", error="考试尚未开始"), 409
         exam = get_exam(conn, attempt["exam_id"])
         within = attempt["deadline"] is not None and now <= attempt["deadline"] + SUBMIT_GRACE_SECONDS
         if within:
