@@ -186,6 +186,99 @@ check("发布后自动保存照常",
 r = c.post(f"/api/s/{tok5}/submit", json={"answers": {"q1": 0}}).get_json()
 check("发布后交卷判分照常(1分)", r.get("status") == "submitted" and r.get("score") == 1, str(r))
 
+# ---------- 场景6: 每人题目顺序不同, 但自己刷新不变; 老师视角按原题号 ----------
+import random as _random
+
+r = client.post("/api/exams", json={
+    "title": "防瞟题序测验",
+    "duration_seconds": 60,
+    "questions": [
+        {"id": "q1", "text": "题一", "type": "single", "options": ["A", "B"], "answer": 0},
+        {"id": "q2", "text": "题二", "type": "single", "options": ["A", "B"], "answer": 1},
+        {"id": "q3", "text": "题三", "type": "single", "options": ["A", "B"], "answer": 0},
+        {"id": "q4", "text": "题四", "type": "single", "options": ["A", "B"], "answer": 1},
+    ],
+    "students": ["甲", "乙", "丙", "丁", "戊", "己"],
+})
+exam6 = r.get_json()
+assert r.status_code == 200, exam6
+# 用确定性 RNG 替身: 同一种子连续产出的排列必然不全相同, 避免概率性断言
+_rng = _random.Random(20240913)
+app_globals = __import__("app").random
+_orange_method = app_globals.SystemRandom
+class _SeededSystemRandom(_random.SystemRandom):
+    def shuffle(self, x):
+        _rng.shuffle(x)
+app_globals.SystemRandom = _SeededSystemRandom
+try:
+    client.post(f"/api/exams/{exam6['exam_id']}/publish")
+finally:
+    app_globals.SystemRandom = _orange_method
+
+states, orders = {}, {}
+for name in ("甲", "乙", "丙", "丁", "戊", "己"):
+    tok = token_of(exam6, name)
+    s = client.get(f"/api/s/{tok}/state").get_json()
+    states[name] = s
+    orders[name] = [q["id"] for q in s["questions"]]
+    check(f"{name}拿到的是完整 4 题", set(orders[name]) == {"q1", "q2", "q3", "q4"}, str(orders[name]))
+
+check("同场考生题目顺序不都一样(防邻座瞟题)", len(set(map(tuple, orders.values()))) > 1, str(orders))
+
+# 学生自己刷新/断网重连: 顺序必须稳定
+for name in ("甲", "乙"):
+    tok = token_of(exam6, name)
+    again = client.get(f"/api/s/{tok}/state").get_json()
+    check(f"{name}刷新后题序不变", [q["id"] for q in again["questions"]] == orders[name],
+          f"{orders[name]} vs {[q['id'] for q in again['questions']]}")
+
+# 按各自打乱后的显示位置作答, 判分仍按题目 id 走, 不能对错号
+# 构造"全对": 按每题在该学生页面上的位置选正确选项
+def correct_answers_in_display_order(s):
+    text_to_correct = {"题一": 0, "题二": 1, "题三": 0, "题四": 1}
+    return {q["id"]: text_to_correct[q["text"]] for q in s["questions"]}
+
+s = states["丙"]
+ans = correct_answers_in_display_order(s)
+client.post(f"/api/s/{token_of(exam6, '丙')}/answers", json={"answers": ans, "rev": 1})
+sub = client.post(f"/api/s/{token_of(exam6, '丙')}/submit", json={"answers": ans}).get_json()
+check("题序打乱后按页面作答判分仍正确(4分)", sub.get("score") == 4, str(sub))
+
+# 乙故意全错 -> 0 分; 丁只答对两题 -> 2 分
+s = states["乙"]
+wrong = {q["id"]: 1 - {"题一": 0, "题二": 1, "题三": 0, "题四": 1}[q["text"]] for q in s["questions"]}
+client.post(f"/api/s/{token_of(exam6, '乙')}/submit", json={"answers": wrong})
+s = states["丁"]
+all_correct = {"题一": 0, "题二": 1, "题三": 0, "题四": 1}
+half = {q["id"]: (all_correct[q["text"]] if q["text"] in ("题一", "题二") else 1 - all_correct[q["text"]])
+        for q in s["questions"]}
+client.post(f"/api/s/{token_of(exam6, '丁')}/submit", json={"answers": half})
+
+d = client.get(f"/api/exams/{exam6['exam_id']}").get_json()
+check("老师后台题目仍是原始题号顺序",
+      [q["text"] for q in d["questions"]] == ["题一", "题二", "题三", "题四"])
+stats = {st["id"]: st for st in d["question_stats"]}
+# 已收卷 3 人(丙/乙/丁); q1: 丙对 乙错 丁对 -> 正确 2; q2 同理 2; q3: 丙对 乙错 丁错 -> 1; q4 同 -> 1
+check("每题统计按原始题号聚合(q1 正确2人)", stats["q1"]["correct"] == 2, str(stats["q1"]))
+check("每题统计按原始题号聚合(q3 正确1人)", stats["q3"]["correct"] == 1, str(stats["q3"]))
+check("每题选项计数正确(q2 选B为正确项 2 人)", stats["q2"]["option_counts"] == [1, 2], str(stats["q2"]))
+check("统计分母为已收卷人数(3)", stats["q1"]["graded_count"] == 3 and stats["q1"]["answered"] == 3)
+
+# 学生端仍然拿不到正确答案
+check("打乱下发时正确答案依然不下发", all("answer" not in q for q in states["甲"]["questions"]))
+
+# ---------- 场景7: 单题考试不需要打乱, 顺序就是原题序 ----------
+r = client.post("/api/exams", json={
+    "title": "单题测验", "duration_seconds": 60,
+    "questions": [{"id": "q1", "text": "唯一一题", "type": "single", "options": ["对", "错"], "answer": 0}],
+    "students": ["钱一"],
+})
+exam7 = r.get_json()
+client.post(f"/api/exams/{exam7['exam_id']}/publish")
+tok7 = token_of(exam7, "钱一")
+s = client.get(f"/api/s/{tok7}/state").get_json()
+check("单题考试顺序固定为原题序", [q["id"] for q in s["questions"]] == ["q1"])
+
 print()
 failed = [n for n, ok, _ in results if not ok]
 print(f"共 {len(results)} 项检查, 通过 {len(results) - len(failed)}, 失败 {len(failed)}")

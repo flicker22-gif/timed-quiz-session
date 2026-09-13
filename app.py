@@ -5,12 +5,14 @@
 - 老师创建考试(时长/题目/学生名单), 系统为每人生成独立链接
 - 学生打开链接即开始倒计时(服务端计时), 答题自动保存
 - 刷新/断网后重新打开链接可接着答, 到点强制收卷
+- 同一场考试每人题目顺序不同(发布时生成并固定), 防止邻座瞟题号; 刷新/断网回来顺序不变
 - 重复提交幂等: 一个学生只有一条答卷记录, 刷接口也刷不出第二条
 
 运行: python3 app.py   然后浏览器访问 http://127.0.0.1:5000/
 """
 import json
 import os
+import random
 import secrets
 import sqlite3
 import time
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     deadline     REAL,
     answers      TEXT NOT NULL DEFAULT '{}',  -- JSON 对象 {题目id: 答案}
     answers_rev  INTEGER NOT NULL DEFAULT 0,  -- 答案版本号, 只接受更大的 rev, 防止旧保存请求覆盖新答案
+    question_order TEXT,                      -- JSON 数组: 该学生看到的题目 id 顺序, 发布时固定
     score        INTEGER,
     submitted_at REAL
 );
@@ -69,6 +72,8 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(attempts)")]
         if "answers_rev" not in cols:
             conn.execute("ALTER TABLE attempts ADD COLUMN answers_rev INTEGER NOT NULL DEFAULT 0")
+        if "question_order" not in cols:
+            conn.execute("ALTER TABLE attempts ADD COLUMN question_order TEXT")
 
 
 def parse_body():
@@ -89,6 +94,36 @@ def grade(questions, answers):
             if answers.get(q["id"]) == q["answer"]:
                 score += 1
     return score
+
+
+def shuffled_question_ids(questions):
+    """一份随机题目 id 顺序; 只有一道题时保持原样, 避免无谓差异。"""
+    ids = [q["id"] for q in questions]
+    if len(ids) > 1:
+        random.SystemRandom().shuffle(ids)
+    return ids
+
+
+def order_for_attempt(conn, attempt, questions):
+    """
+    返回该学生固定的题目顺序(id 列表)。发布时已生成;
+    老库/老考试等没有顺序数据的, 首次进场时补生成并落库(之后刷新不再变)。
+    """
+    raw = attempt["question_order"]
+    if raw:
+        try:
+            order = json.loads(raw)
+            valid = {q["id"] for q in questions}
+            if set(order) == valid and len(order) == len(valid):
+                return order
+        except ValueError:
+            pass
+    order = shuffled_question_ids(questions)
+    conn.execute(
+        "UPDATE attempts SET question_order=? WHERE token=?",
+        (json.dumps(order, ensure_ascii=False), attempt["token"]),
+    )
+    return order
 
 
 def finalize(conn, attempt, exam, status, now, answers=None):
@@ -212,6 +247,14 @@ def publish_exam(exam_id):
         exam = get_exam(conn, exam_id)
         if exam["status"] == "published":
             return jsonify(ok=True, already=True, status="published")
+        questions = json.loads(exam["questions"])
+        # 发布这一刻为每个学生固定一份不同的题目顺序; 顺序存库, 刷新/断网回来都不变
+        rows = conn.execute("SELECT token FROM attempts WHERE exam_id=?", (exam_id,)).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE attempts SET question_order=? WHERE token=?",
+                (json.dumps(shuffled_question_ids(questions), ensure_ascii=False), r["token"]),
+            )
         conn.execute(
             "UPDATE exams SET status='published', published_at=? WHERE id=? AND status='draft'",
             (now, exam_id),
@@ -234,13 +277,36 @@ def exam_detail(exam_id):
         attempts = conn.execute(
             "SELECT * FROM attempts WHERE exam_id=? ORDER BY student_name", (exam_id,)
         ).fetchall()
+        questions = json.loads(exam["questions"])
+        # 每题统计一律按考试原始题目顺序/原始题号聚合, 与学生看到的打乱顺序无关
+        stats = []
+        graded = [a for a in attempts if a["status"] in ("submitted", "expired")]
+        for q in questions:
+            item = {"id": q["id"], "answered": 0}
+            if q.get("type") == "single":
+                n_opts = len(q.get("options") or [])
+                counts = [0] * n_opts
+                correct = 0
+                for a in graded:
+                    val = json.loads(a["answers"]).get(q["id"])
+                    if val is None:
+                        continue
+                    item["answered"] += 1
+                    if isinstance(val, int) and 0 <= val < n_opts:
+                        counts[val] += 1
+                    if "answer" in q and val == q["answer"]:
+                        correct += 1
+                item["option_counts"] = counts
+                item["correct"] = correct
+                item["graded_count"] = len(graded)
+            stats.append(item)
         return jsonify(
             exam_id=exam_id,
             title=exam["title"],
             duration_seconds=exam["duration_seconds"],
             status=exam["status"],
             published_at=exam["published_at"],
-            questions=json.loads(exam["questions"]),
+            questions=questions,
             attempts=[
                 {
                     "student": a["student_name"],
@@ -253,6 +319,7 @@ def exam_detail(exam_id):
                 }
                 for a in attempts
             ],
+            question_stats=stats,
         )
 
 
@@ -285,6 +352,10 @@ def student_state(token):
             attempt = get_attempt(conn, token)
 
         questions = json.loads(exam["questions"])
+        # 按该学生固定的顺序下发(发布时生成; 老数据首次进场补生成), 邻座顺序各不相同
+        order = order_for_attempt(conn, attempt, questions)
+        by_id = {q["id"]: q for q in questions}
+        questions = [by_id[qid] for qid in order]
         for q in questions:
             q.pop("answer", None)  # 不下发正确答案
         done = attempt["status"] in ("submitted", "expired")
@@ -621,10 +692,12 @@ TEACHER_HTML = """<!doctype html>
 <table><thead><tr><th>学生</th><th>状态</th><th>剩余时间</th><th>客观题得分</th><th>答题链接</th></tr></thead>
 <tbody id="rows"></tbody></table>
 <h3>题目与答案</h3><div id="qs"></div>
+<h3>每题统计</h3><div id="qstats"><p>收卷后按原始题号统计。</p></div>
 <script>
 const EXAM_ID = "__EXAM_ID__";
 const STATUS = {not_started:'未开始', in_progress:'答题中', submitted:'已交卷', expired:'超时收卷'};
 function fmt(s){ if(s===null||s===undefined) return '-'; const m=String(Math.floor(s/60)).padStart(2,'0'); return m+':'+String(s%60).padStart(2,'0'); }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function refresh(){
   const r = await fetch('/api/exams/' + EXAM_ID);
   const d = await r.json();
@@ -642,6 +715,23 @@ async function refresh(){
     '<p><b>' + (i+1) + '. ' + q.text + '</b>' +
     (q.type==='single' ? '<br>' + q.options.map((o,j)=> (j===q.answer?'✅ ':'　') + o).join('<br>') : ' <i>(简答题, 不自动判分)</i>') + '</p>'
   ).join('');
+  // 每题统计按原始题号(第 N 题即建卷时的顺序), 与学生端各自的打乱顺序无关
+  const statById = {};
+  (d.question_stats || []).forEach(st => statById[st.id] = st);
+  document.getElementById('qstats').innerHTML = d.questions.map((q,i) => {
+    const st = statById[q.id] || {};
+    let body;
+    if(q.type === 'single'){
+      const n = st.graded_count || 0;
+      const rate = n ? Math.round((st.correct||0) / n * 100) + '%' : '-';
+      body = q.options.map((o,j) => '　' + (j===q.answer?'✅':'　') + ' ' + o + ': <b>' + ((st.option_counts||[])[j]||0) + '</b> 人' +
+             (j===q.answer ? '（正确）' : '')).join('<br>') +
+             '<br>已答 ' + (st.answered||0) + '/' + n + ' 份 · 正确率 ' + rate;
+    } else {
+      body = '已交卷中作答 ' + (st.answered||0) + ' 份（简答题需人工评阅）';
+    }
+    return '<p style="border-top:1px solid #eee;padding-top:8px"><b>第 ' + (i+1) + ' 题</b> ' + escapeHtml(q.text) + '<br>' + body + '</p>';
+  }).join('');
 }
 async function publishExam(){
   if(!confirm('发布后学生即可进场, 且题目不能再修改。确认发布?')) return;
