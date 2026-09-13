@@ -279,6 +279,69 @@ tok7 = token_of(exam7, "钱一")
 s = client.get(f"/api/s/{tok7}/state").get_json()
 check("单题考试顺序固定为原题序", [q["id"] for q in s["questions"]] == ["q1"])
 
+# ---------- 场景8: 交卷答案格式不对 -> 4xx 且不改状态; 之后正常/超时/重复交卷照常 ----------
+exam8 = make_exam(client, students=("冯十一", "陈十二"))
+bad_cases = [
+    ["q1", 1],                       # 数组
+    "q1=1",                          # 字符串
+    42,                              # 数字
+    True,                            # 布尔
+]
+for bad in bad_cases:
+    tok = token_of(exam8, "冯十一")
+    c = app.test_client()
+    c.get(f"/api/s/{tok}/state")     # 开考
+    r = c.post(f"/api/s/{tok}/submit", json={"answers": bad})
+    check(f"交卷答案格式错误({type(bad).__name__})返回 400 而非 500",
+          r.status_code == 400, f"{r.status_code} {r.data[:120]!r}")
+    s = c.get(f"/api/s/{tok}/state").get_json()
+    check("格式错误后仍是答题中, 可重新交", s["status"] == "in_progress", str(s["status"]))
+
+# 先保存正确答案, 再用错误格式交卷被拒, 已存进度不受影响
+tok = token_of(exam8, "冯十一")
+c = app.test_client()
+c.get(f"/api/s/{tok}/state")
+c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1}, "rev": 1})
+r = c.post(f"/api/s/{tok}/submit", json={"answers": ["非法"]})
+check("非法交卷被拒(400)", r.status_code == 400, f"{r.status_code}")
+s = c.get(f"/api/s/{tok}/state").get_json()
+check("被拒后已保存的答案仍在", s["answers"] == {"q1": 1, "q2": 1}, str(s["answers"]))
+# 改成合法格式重新交卷 -> 正常判分
+r1 = c.post(f"/api/s/{tok}/submit", json={"answers": {"q1": 1, "q2": 1}}).get_json()
+check("修正格式后正常交卷判分(2分)", r1.get("status") == "submitted" and r1.get("score") == 2, str(r1))
+# 再重复交(即便这次带着非法答案)也应幂等返回原结果, 不报错、不改分
+r2 = c.post(f"/api/s/{tok}/submit", json={"answers": ["非法"]}).get_json()
+check("收卷后重复交卷幂等(非法体也不改结果)",
+      r2.get("duplicate") and r2.get("status") == "submitted" and r2.get("score") == 2, str(r2))
+
+# 超时收卷: 即使交卷请求体格式非法, 也照常按已保存答案强收, 不报 500
+exam8b = make_exam(client, duration=2, students=("陈十二",))
+tok = token_of(exam8b, "陈十二")
+c = app.test_client()
+c.get(f"/api/s/{tok}/state")
+c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1, "q3": "疏散"}, "rev": 1})
+time.sleep(2.5)
+import app as _app_mod
+_app_mod.SUBMIT_GRACE_SECONDS = 0   # 模拟已过交卷宽限, 走超时强收分支
+try:
+    r = c.post(f"/api/s/{tok}/submit", json={"answers": ["非法"]})
+finally:
+    _app_mod.SUBMIT_GRACE_SECONDS = 5
+d = r.get_json()
+check("超时后非法交卷体不影响强收(200/expired/2分)",
+      r.status_code == 200 and d.get("status") == "expired" and d.get("score") == 2,
+      f"{r.status_code} {d}")
+
+# 缺省 answers 字段仍允许: 用已自动保存的答案交卷(老行为不变)
+exam8c = make_exam(client, students=("褚十三",))
+tok = token_of(exam8c, "褚十三")
+c = app.test_client()
+c.get(f"/api/s/{tok}/state")
+c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1}, "rev": 1})
+r = c.post(f"/api/s/{tok}/submit", json={})
+check("不带 answers 交卷沿用已保存答案(2分)",
+      r.status_code == 200 and r.get_json().get("score") == 2, f"{r.status_code} {r.get_json()}")
+
 print()
 failed = [n for n, ok, _ in results if not ok]
 print(f"共 {len(results)} 项检查, 通过 {len(results) - len(failed)}, 失败 {len(failed)}")

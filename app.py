@@ -429,8 +429,15 @@ def submit(token):
         exam = get_exam(conn, attempt["exam_id"])
         within = attempt["deadline"] is not None and now <= attempt["deadline"] + SUBMIT_GRACE_SECONDS
         if within:
+            # 宽限内会采用本次携带的答案, 格式必须是 {题目id: 答案};
+            # 格式不对明确拒绝(400), 不判分、不改状态, 学生改好后还能重新交
+            if answers is not None and not isinstance(answers, dict):
+                return jsonify(
+                    ok=False, status="in_progress", error="answers 必须是对象 {题目id: 答案}"
+                ), 400
             score = finalize(conn, attempt, exam, "submitted", now, answers)
             return jsonify(ok=True, duplicate=False, status="submitted", score=score)
+        # 已过宽限: 请求体里的答案不再采用, 用已自动保存的答案判分, 格式对错都照常强收
         score = finalize(conn, attempt, exam, "expired", now)
         return jsonify(ok=True, duplicate=False, status="expired", score=score)
 
