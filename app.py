@@ -7,10 +7,13 @@
 - 刷新/断网后重新打开链接可接着答, 到点强制收卷
 - 同一场考试每人题目顺序不同(发布时生成并固定), 防止邻座瞟题号; 刷新/断网回来顺序不变
 - 重复提交幂等: 一个学生只有一条答卷记录, 刷接口也刷不出第二条
+- 单选题交卷即自动判分; 简答题进入待评分, 由老师在管理后台逐份打分、写评语
+- 成绩在老师"发布成绩"前对学生完全不可见; 发布后学生刷新自己的链接, 只能看到本人的总分/各题得分/评语
 
 运行: python3 app.py   然后浏览器访问 http://127.0.0.1:5000/
 """
 import json
+import math
 import os
 import random
 import secrets
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS exams (
     questions        TEXT NOT NULL,           -- JSON 数组
     status           TEXT NOT NULL DEFAULT 'draft',  -- draft/published; 发布后不可改题、不可撤回
     published_at     REAL,
+    results_published_at REAL,                -- 成绩发布时间; NULL = 学生看不到任何分数
     created_at       REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attempts (
@@ -46,7 +50,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     answers      TEXT NOT NULL DEFAULT '{}',  -- JSON 对象 {题目id: 答案}
     answers_rev  INTEGER NOT NULL DEFAULT 0,  -- 答案版本号, 只接受更大的 rev, 防止旧保存请求覆盖新答案
     question_order TEXT,                      -- JSON 数组: 该学生看到的题目 id 顺序, 发布时固定
-    score        INTEGER,
+    score        INTEGER,                     -- 客观题得分(交卷时自动判); 简答题分数在 grading 里
+    grading      TEXT NOT NULL DEFAULT '{}',  -- JSON 对象 {题目id: {"score": x, "comment": "..."}} 老师对简答题的评分
     submitted_at REAL
 );
 """
@@ -69,11 +74,15 @@ def init_db():
             conn.execute("UPDATE exams SET status='published'")
         if "published_at" not in cols:
             conn.execute("ALTER TABLE exams ADD COLUMN published_at REAL")
+        if "results_published_at" not in cols:
+            conn.execute("ALTER TABLE exams ADD COLUMN results_published_at REAL")
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(attempts)")]
         if "answers_rev" not in cols:
             conn.execute("ALTER TABLE attempts ADD COLUMN answers_rev INTEGER NOT NULL DEFAULT 0")
         if "question_order" not in cols:
             conn.execute("ALTER TABLE attempts ADD COLUMN question_order TEXT")
+        if "grading" not in cols:
+            conn.execute("ALTER TABLE attempts ADD COLUMN grading TEXT NOT NULL DEFAULT '{}'")
 
 
 def parse_body():
@@ -94,6 +103,70 @@ def grade(questions, answers):
             if answers.get(q["id"]) == q["answer"]:
                 score += 1
     return score
+
+
+def _is_num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def points_of(q):
+    """简答题满分; 老数据的简答题没有 points 字段, 默认 5 分。"""
+    p = q.get("points")
+    return p if isinstance(p, int) and not isinstance(p, bool) and p > 0 else 5
+
+
+def parse_grading(attempt):
+    """读出一份答卷的简答题评分 {题目id: {score, comment}}; 老数据/脏数据一律按未评处理。"""
+    try:
+        g = json.loads(attempt["grading"] or "{}")
+    except (ValueError, TypeError):
+        g = {}
+    return g if isinstance(g, dict) else {}
+
+
+def total_score(attempt):
+    """总分 = 客观题得分 + 已评简答题得分之和(未评的按 0 计)。"""
+    obj = attempt["score"] or 0
+    subj = 0
+    for g in parse_grading(attempt).values():
+        if isinstance(g, dict) and _is_num(g.get("score")):
+            subj += g["score"]
+    return obj + subj
+
+
+def result_payload(attempt, questions, order):
+    """
+    成绩发布后给学生看的本人成绩明细: 各题得分/满分/评语。
+    只含学生自己的答案和分数, 绝不含正确答案, 也不含他人信息。
+    """
+    grading = parse_grading(attempt)
+    answers = json.loads(attempt["answers"])
+    by_id = {q["id"]: q for q in questions}
+    items = []
+    for qid in order:
+        q = by_id.get(qid)
+        if not q:
+            continue
+        if q.get("type") == "single":
+            got = answers.get(qid)
+            items.append({
+                "id": qid, "type": "single", "your_answer": got,
+                "score": 1 if "answer" in q and got == q["answer"] else 0,
+                "max_score": 1,
+            })
+        else:
+            g = grading.get(qid) or {}
+            items.append({
+                "id": qid, "type": "text", "your_answer": answers.get(qid),
+                "score": g.get("score"),          # None = 老师尚未评分
+                "max_score": points_of(q),
+                "comment": g.get("comment") or "",
+            })
+    obj = attempt["score"] or 0
+    subj = sum(g["score"] for g in grading.values()
+               if isinstance(g, dict) and _is_num(g.get("score")))
+    return {"objective_score": obj, "subjective_score": subj,
+            "total_score": obj + subj, "items": items}
 
 
 def shuffled_question_ids(questions):
@@ -127,7 +200,7 @@ def order_for_attempt(conn, attempt, questions):
 
 
 def finalize(conn, attempt, exam, status, now, answers=None):
-    """收卷: 用已保存(或最后提交)的答案判分并落库。调用方需持有事务。"""
+    """收卷: 用已保存(或最后提交)的答案判客观题并落库; 简答题留待老师评分。调用方需持有事务。"""
     final_answers = answers if answers is not None else json.loads(attempt["answers"])
     score = grade(json.loads(exam["questions"]), final_answers)
     conn.execute(
@@ -264,7 +337,7 @@ def publish_exam(exam_id):
 
 @app.get("/api/exams/<exam_id>")
 def exam_detail(exam_id):
-    """老师视角: 考试信息 + 每个学生的状态/分数。顺便把超时未收的卷 lazy 收掉。"""
+    """老师视角: 考试信息 + 每个学生的状态/客观分/总分/简答题批改情况。顺便把超时未收的卷 lazy 收掉。"""
     now = time.time()
     with db() as conn:
         exam = get_exam(conn, exam_id)
@@ -278,6 +351,7 @@ def exam_detail(exam_id):
             "SELECT * FROM attempts WHERE exam_id=? ORDER BY student_name", (exam_id,)
         ).fetchall()
         questions = json.loads(exam["questions"])
+        text_qids = [q["id"] for q in questions if q.get("type") != "single"]
         # 每题统计一律按考试原始题目顺序/原始题号聚合, 与学生看到的打乱顺序无关
         stats = []
         graded = [a for a in attempts if a["status"] in ("submitted", "expired")]
@@ -299,26 +373,53 @@ def exam_detail(exam_id):
                 item["option_counts"] = counts
                 item["correct"] = correct
                 item["graded_count"] = len(graded)
+            else:
+                # 简答题: 作答份数 / 已评份数 / 平均分
+                graded_n = 0
+                tot = 0
+                for a in graded:
+                    val = json.loads(a["answers"]).get(q["id"])
+                    if isinstance(val, str) and val.strip():
+                        item["answered"] += 1
+                    g = parse_grading(a).get(q["id"])
+                    if isinstance(g, dict) and _is_num(g.get("score")):
+                        graded_n += 1
+                        tot += g["score"]
+                item["graded"] = graded_n
+                item["avg_score"] = round(tot / graded_n, 2) if graded_n else None
+                item["max_score"] = points_of(q)
             stats.append(item)
+
+        def attempt_view(a):
+            done = a["status"] in ("submitted", "expired")
+            grading = parse_grading(a)
+            return {
+                "student": a["student_name"],
+                "token": a["token"],
+                "status": a["status"],
+                "score": a["score"],                              # 客观题得分
+                "total_score": total_score(a) if done else None,  # 客观 + 已评简答
+                "grading": grading,
+                "answers": json.loads(a["answers"]),              # 老师要看简答题作答内容才能评分
+                "pending_count": (
+                    sum(1 for qid in text_qids if qid not in grading) if done else 0
+                ),
+                "remaining_seconds": (
+                    max(0, int(a["deadline"] - now)) if a["status"] == "in_progress" and a["deadline"] else None
+                ),
+                "url": f"/s/{a['token']}",
+            }
+
         return jsonify(
             exam_id=exam_id,
             title=exam["title"],
             duration_seconds=exam["duration_seconds"],
             status=exam["status"],
             published_at=exam["published_at"],
+            results_published=exam["results_published_at"] is not None,
+            results_published_at=exam["results_published_at"],
             questions=questions,
-            attempts=[
-                {
-                    "student": a["student_name"],
-                    "status": a["status"],
-                    "score": a["score"],
-                    "remaining_seconds": (
-                        max(0, int(a["deadline"] - now)) if a["status"] == "in_progress" and a["deadline"] else None
-                    ),
-                    "url": f"/s/{a['token']}",
-                }
-                for a in attempts
-            ],
+            attempts=[attempt_view(a) for a in attempts],
             question_stats=stats,
         )
 
@@ -355,23 +456,31 @@ def student_state(token):
         # 按该学生固定的顺序下发(发布时生成; 老数据首次进场补生成), 邻座顺序各不相同
         order = order_for_attempt(conn, attempt, questions)
         by_id = {q["id"]: q for q in questions}
-        questions = [by_id[qid] for qid in order]
-        for q in questions:
-            q.pop("answer", None)  # 不下发正确答案
+        ordered = [dict(by_id[qid]) for qid in order]
+        for q in ordered:
+            q.pop("answer", None)  # 正确答案永不下发(成绩发布后也不给)
         done = attempt["status"] in ("submitted", "expired")
-        return jsonify(
-            title=exam["title"],
-            status=attempt["status"],
-            questions=questions,
-            answers=json.loads(attempt["answers"]),
-            rev=attempt["answers_rev"],
-            remaining_seconds=(
+        published = exam["results_published_at"] is not None
+        resp = {
+            "title": exam["title"],
+            "status": attempt["status"],
+            "questions": ordered,
+            "answers": json.loads(attempt["answers"]),
+            "rev": attempt["answers_rev"],
+            "remaining_seconds": (
                 max(0, int(attempt["deadline"] - now))
                 if attempt["status"] == "in_progress" and attempt["deadline"]
                 else 0
             ),
-            score=attempt["score"] if done else None,
-        )
+            "results_published": published,
+            "score": None,  # 成绩发布前, 任何情况下都不给学生分数
+        }
+        if done and published:
+            # 只回传本人的成绩明细; 不含正确答案, 也不含他人信息
+            res = result_payload(attempt, questions, order)
+            resp["result"] = res
+            resp["score"] = res["total_score"]
+        return jsonify(resp)
 
 
 @app.post("/api/s/<token>/answers")
@@ -413,20 +522,27 @@ def submit(token):
     """
     交卷(幂等)。已收卷时重复调用直接返回原结果, 不会产生第二条记录。
     截止时间+宽限内: 接受本次携带的答案, 记 submitted; 之后: 只用已保存的答案, 记 expired。
+    成绩未发布时, 响应里不带任何分数。
     """
     now = time.time()
     answers = parse_body().get("answers")
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         attempt = get_attempt(conn, token)
+        exam = get_exam(conn, attempt["exam_id"])
+        published = exam["results_published_at"] is not None
+
+        def result(ok, dup, status):
+            out = {"ok": ok, "duplicate": dup, "status": status, "results_published": published}
+            if published and status in ("submitted", "expired"):
+                out["score"] = total_score(get_attempt(conn, token))
+            return jsonify(out)
+
         if attempt["status"] in ("submitted", "expired"):
-            return jsonify(
-                ok=True, duplicate=True, status=attempt["status"], score=attempt["score"]
-            )
+            return result(True, True, attempt["status"])
         if attempt["status"] == "not_started":
             # 未打开过答题页就没有计时, 不允许交卷; 否则持链接者可把未开始的卷子直接作废
             return jsonify(ok=False, status="not_started", error="考试尚未开始"), 409
-        exam = get_exam(conn, attempt["exam_id"])
         within = attempt["deadline"] is not None and now <= attempt["deadline"] + SUBMIT_GRACE_SECONDS
         if within:
             # 宽限内会采用本次携带的答案, 格式必须是 {题目id: 答案};
@@ -435,11 +551,85 @@ def submit(token):
                 return jsonify(
                     ok=False, status="in_progress", error="answers 必须是对象 {题目id: 答案}"
                 ), 400
-            score = finalize(conn, attempt, exam, "submitted", now, answers)
-            return jsonify(ok=True, duplicate=False, status="submitted", score=score)
+            finalize(conn, attempt, exam, "submitted", now, answers)
+            return result(True, False, "submitted")
         # 已过宽限: 请求体里的答案不再采用, 用已自动保存的答案判分, 格式对错都照常强收
-        score = finalize(conn, attempt, exam, "expired", now)
-        return jsonify(ok=True, duplicate=False, status="expired", score=score)
+        finalize(conn, attempt, exam, "expired", now)
+        return result(True, False, "expired")
+
+
+@app.post("/api/exams/<exam_id>/grade")
+def grade_attempt(exam_id):
+    """
+    老师给一份答卷的简答题评分(幂等)。body: {token, grades: {题目id: {score, comment}}}
+    - 只接受本场考试的简答题; 分值不能超过题目满分(points, 老数据默认 5)
+    - 重复提交相同评分是幂等 no-op; 提交不同分值视为改分, 直接覆盖
+    - 成绩发布后仍可改分(学生刷新即看到更新); 未收卷的答卷一律不能评
+    """
+    payload = parse_body()
+    token = payload.get("token")
+    grades = payload.get("grades")
+    if not isinstance(token, str) or not isinstance(grades, dict):
+        return jsonify(error="需要 token 和 grades(对象)"), 400
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")   # 读-改-写在同一写事务里, 并发评分不会互相覆盖
+        exam = get_exam(conn, exam_id)
+        if exam["status"] != "published":
+            return jsonify(error="考试尚未发布, 还没有答卷可评"), 409
+        attempt = get_attempt(conn, token)
+        if attempt["exam_id"] != exam_id:
+            abort(404)
+        if attempt["status"] not in ("submitted", "expired"):
+            return jsonify(error="该生尚未交卷, 不能评分"), 409
+        questions = json.loads(exam["questions"])
+        text_qs = {q["id"]: q for q in questions if q.get("type") != "single"}
+        grading = parse_grading(attempt)
+        for qid, g in grades.items():
+            q = text_qs.get(qid)
+            if q is None:
+                return jsonify(error=f"{qid} 不是本场考试的简答题"), 400
+            if not isinstance(g, dict):
+                return jsonify(error="grades 每项必须是 {score, comment} 对象"), 400
+            score = g.get("score")
+            comment = g.get("comment", "")
+            maxp = points_of(q)
+            if not _is_num(score) or not math.isfinite(score) or not 0 <= score <= maxp:
+                return jsonify(error=f"{qid} 得分必须是 0~{maxp} 的数字"), 400
+            if not isinstance(comment, str) or len(comment) > 500:
+                return jsonify(error="评语必须是不超过 500 字的字符串"), 400
+            grading[qid] = {"score": score, "comment": comment}
+        conn.execute(
+            "UPDATE attempts SET grading=? WHERE token=?",
+            (json.dumps(grading, ensure_ascii=False), token),
+        )
+        attempt = get_attempt(conn, token)
+        return jsonify(
+            ok=True,
+            token=token,
+            grading=grading,
+            objective_score=attempt["score"] or 0,
+            total_score=total_score(attempt),
+            pending_count=sum(1 for qid in text_qs if qid not in grading),
+            results_published=exam["results_published_at"] is not None,
+        )
+
+
+@app.post("/api/exams/<exam_id>/publish-results")
+def publish_results(exam_id):
+    """发布成绩(幂等)。发布后学生刷新自己的链接即可看到本人总分/各题得分/评语。"""
+    now = time.time()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        exam = get_exam(conn, exam_id)
+        if exam["status"] != "published":
+            return jsonify(error="考试尚未发布, 不能发布成绩"), 409
+        if exam["results_published_at"] is not None:
+            return jsonify(ok=True, already=True, results_published_at=exam["results_published_at"])
+        conn.execute(
+            "UPDATE exams SET results_published_at=? WHERE id=? AND results_published_at IS NULL",
+            (now, exam_id),
+        )
+        return jsonify(ok=True, already=False, results_published_at=now)
 
 
 # ---------------- 页面 ----------------
@@ -477,22 +667,28 @@ function addQuestion(q){
     <label>题干</label><input class="q-text" placeholder="题目内容">
     <div class="row">
       <div><label>类型</label>
-        <select class="q-type" onchange="this.closest('.q').querySelector('.single-only').style.display=this.value==='single'?'block':'none'">
-          <option value="single">单选题(自动判分)</option><option value="text">简答题</option>
+        <select class="q-type" onchange="const p=this.closest('.q');p.querySelector('.single-only').style.display=this.value==='single'?'block':'none';p.querySelector('.text-only').style.display=this.value==='text'?'block':'none'">
+          <option value="single">单选题(自动判分)</option><option value="text">简答题(老师评分)</option>
         </select></div>
     </div>
     <div class="single-only">
       <label>选项(用逗号分隔)</label><input class="q-options" placeholder="选项A, 选项B, 选项C">
       <label>正确答案(第几个选项, 从1开始)</label><input class="q-answer" type="number" min="1" value="1">
+    </div>
+    <div class="text-only" style="display:none">
+      <label>满分分值(老师手动评分, 默认5分)</label><input class="q-points" type="number" min="1" value="5">
     </div>`;
   document.getElementById('questions').appendChild(d);
   if(q){
     d.querySelector('.q-text').value = q.text;
     d.querySelector('.q-type').value = q.type;
     d.querySelector('.single-only').style.display = q.type === 'single' ? 'block' : 'none';
+    d.querySelector('.text-only').style.display = q.type === 'text' ? 'block' : 'none';
     if(q.type === 'single'){
       d.querySelector('.q-options').value = (q.options || []).join(', ');
       d.querySelector('.q-answer').value = (q.answer === undefined ? 0 : q.answer) + 1;
+    }else if(q.points){
+      d.querySelector('.q-points').value = q.points;
     }
   }
 }
@@ -507,6 +703,8 @@ async function saveExam(){
     if(type === 'single'){
       q.options = el.querySelector('.q-options').value.split(/[,，]/).map(s=>s.trim()).filter(Boolean);
       q.answer = Math.max(0, (parseInt(el.querySelector('.q-answer').value, 10) || 1) - 1);
+    }else{
+      q.points = Math.max(1, parseInt(el.querySelector('.q-points').value, 10) || 5);
     }
     questions.push(q);
   });
@@ -579,7 +777,7 @@ async function load(){
   questions = s.questions; answers = s.answers || {}; remaining = s.remaining_seconds;
   rev = s.rev || 0;
   render();
-  if(s.status === 'submitted' || s.status === 'expired'){ showResult(s.status, s.score); return; }
+  if(s.status === 'submitted' || s.status === 'expired'){ finishUI(s); return; }
   setInterval(tick, 1000);
   setInterval(save, 5000);                 // 每 5 秒自动保存
   window.addEventListener('beforeunload', () => {   // 关闭/刷新前兜底保存
@@ -593,6 +791,7 @@ function render(){
   questions.forEach((q, i) => {
     const d = document.createElement('div');
     d.className = 'q';
+    d.dataset.qid = q.id;
     let h = '<b>' + (i+1) + '. ' + escapeHtml(q.text) + '</b><br>';
     if(q.type === 'single'){
       q.options.forEach((op, j) => {
@@ -665,18 +864,45 @@ async function submitExam(auto){
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({answers: collect()}),
   });
-  const d = await r.json();
-  showResult(d.status, d.score);
+  if(r.ok){ location.reload(); return; }   // 交卷后刷新, 由 state 决定显示"待发布"还是本人成绩
+  submitting = false;
+  alert('交卷失败, 请检查网络后重试');
 }
 
-function showResult(status, score){
+function finishUI(s){
   finished = true;
   document.getElementById('submitBtn').disabled = true;
   document.querySelectorAll('input,textarea').forEach(e => e.disabled = true);
   document.getElementById('timer').textContent = '已结束';
-  document.getElementById('result').textContent =
-    (status === 'expired' ? '时间到, 已强制收卷。' : '交卷成功!') +
-    (score === null || score === undefined ? '' : ' 客观题得分: ' + score);
+  const head = s.status === 'expired' ? '时间到, 已强制收卷。' : '交卷成功!';
+  const box = document.getElementById('result');
+  if(!s.results_published || !s.result){
+    // 成绩发布前: 一个分数都不显示
+    box.textContent = head + ' 成绩待老师发布后, 刷新本页即可查看。';
+    return;
+  }
+  const r = s.result;
+  box.innerHTML = escapeHtml(head) + ' 总分: <b>' + r.total_score + '</b> 分' +
+    ' <span style="color:#6b7280;font-size:14px">(客观题 ' + r.objective_score + ' 分 + 简答题 ' + r.subjective_score + ' 分)</span>';
+  // 每题下方标注本题得分; 简答题附老师评语
+  const byId = {};
+  r.items.forEach(it => byId[it.id] = it);
+  document.querySelectorAll('.q').forEach(el => {
+    const it = byId[el.dataset.qid];
+    if(!it) return;
+    const line = document.createElement('div');
+    line.style.cssText = 'margin-top:8px;color:#2563eb';
+    let txt;
+    if(it.type === 'single'){
+      txt = '本题得分: ' + it.score + ' / ' + it.max_score;
+    }else if(it.score === null || it.score === undefined){
+      txt = '简答题(满分 ' + it.max_score + ' 分): 老师尚未评分';
+    }else{
+      txt = '本题得分: ' + it.score + ' / ' + it.max_score + (it.comment ? ' · 老师评语: ' + it.comment : '');
+    }
+    line.textContent = txt;
+    el.appendChild(line);
+  });
 }
 load();
 </script></body></html>"""
@@ -684,44 +910,81 @@ load();
 TEACHER_HTML = """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><title>考试管理</title>
 <style>
- body{font-family:system-ui,sans-serif;max-width:860px;margin:24px auto;padding:0 16px;color:#222}
+ body{font-family:system-ui,sans-serif;max-width:960px;margin:24px auto;padding:0 16px;color:#222}
  table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}
  th{background:#f6f8fa}
+ button{padding:6px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer}
+ .panel{border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:12px}
+ .ans{background:#f6f8fa;border-radius:6px;padding:8px;margin:6px 0;white-space:pre-wrap;word-break:break-all}
+ input[type=number]{width:90px}
 </style></head><body>
 <h2 id="title"></h2>
 <p id="meta"></p>
 <p id="draftBar" style="display:none;background:#fef3c7;border-radius:8px;padding:10px">
   <b>草稿状态:</b> 学生链接暂时无法进场。校对无误后
-  <button onclick="publishExam()" style="padding:6px 14px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer">发布考试</button>
+  <button onclick="publishExam()" style="background:#16a34a">发布考试</button>
   <a id="editLink" href="#">返回编辑草稿</a>
   (发布后不能再修改)
 </p>
-<table><thead><tr><th>学生</th><th>状态</th><th>剩余时间</th><th>客观题得分</th><th>答题链接</th></tr></thead>
+<p id="resultBar" style="display:none;background:#ecfdf5;border-radius:8px;padding:10px"></p>
+<table><thead><tr><th>学生</th><th>状态</th><th>剩余时间</th><th>客观题</th><th>简答题</th><th>总分</th><th>待评</th><th>答题链接</th></tr></thead>
 <tbody id="rows"></tbody></table>
+<h3 id="gradingTitle" style="display:none">简答题批改</h3>
+<div id="grading"></div>
 <h3>题目与答案</h3><div id="qs"></div>
-<h3>每题统计</h3><div id="qstats"><p>收卷后按原始题号统计。</p></div>
+<h3>每题统计</h3><div id="qstats"></div>
 <script>
 const EXAM_ID = "__EXAM_ID__";
 const STATUS = {not_started:'未开始', in_progress:'答题中', submitted:'已交卷', expired:'超时收卷'};
+let EXAM = null;
+let gradingDirty = false;   // 老师正在输入时, 自动刷新不重置批改面板
 function fmt(s){ if(s===null||s===undefined) return '-'; const m=String(Math.floor(s/60)).padStart(2,'0'); return m+':'+String(s%60).padStart(2,'0'); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function pointsOf(q){ return (typeof q.points === 'number' && q.points > 0) ? q.points : 5; }
+
 async function refresh(){
   const r = await fetch('/api/exams/' + EXAM_ID);
   const d = await r.json();
+  EXAM = d;
   document.getElementById('title').textContent = d.title;
   document.getElementById('meta').textContent =
     '时长 ' + Math.round(d.duration_seconds/60) + ' 分钟 · 状态: ' +
     (d.status === 'draft' ? '草稿(未发布)' : '已发布') + ' · 每 4 秒自动刷新';
   document.getElementById('draftBar').style.display = d.status === 'draft' ? 'block' : 'none';
   document.getElementById('editLink').href = '/?edit=' + EXAM_ID;
-  document.getElementById('rows').innerHTML = d.attempts.map(a =>
-    '<tr><td>' + a.student + '</td><td>' + STATUS[a.status] + '</td><td>' + fmt(a.remaining_seconds) +
-    '</td><td>' + (a.score===null?'-':a.score) + '</td><td><a href="' + a.url + '">' + location.origin + a.url + '</a></td></tr>'
-  ).join('');
+
+  // 成绩发布条: 未发布前学生看不到任何分数
+  const bar = document.getElementById('resultBar');
+  if(d.status === 'published'){
+    const pending = d.attempts.reduce((n, a) => n + (a.pending_count || 0), 0);
+    bar.style.display = 'block';
+    bar.innerHTML = d.results_published
+      ? '<b>成绩已发布</b> · 学生刷新自己的链接即可看到本人成绩' +
+        (pending ? ' · 还有 <b>' + pending + '</b> 道简答题未评分(暂按 0 计入总分), 在下方评分后学生刷新即可看到更新' : '')
+      : '<b>成绩未发布</b> · 学生现在看不到任何分数' +
+        (pending ? ' · 还有 <b>' + pending + '</b> 道简答题待评分' : '') +
+        ' <button onclick="publishResults()">发布成绩</button>';
+  } else {
+    bar.style.display = 'none';
+  }
+
+  document.getElementById('rows').innerHTML = d.attempts.map(a => {
+    const done = a.status === 'submitted' || a.status === 'expired';
+    const subj = done ? (a.total_score - (a.score || 0)) : '-';
+    return '<tr><td>' + escapeHtml(a.student) + '</td><td>' + STATUS[a.status] + '</td><td>' + fmt(a.remaining_seconds) +
+      '</td><td>' + (a.score === null ? '-' : a.score) + '</td><td>' + subj + '</td>' +
+      '<td><b>' + (done ? a.total_score : '-') + '</b></td><td>' + (a.pending_count || 0) + '</td>' +
+      '<td><a href="' + a.url + '">' + location.origin + a.url + '</a></td></tr>';
+  }).join('');
+
+  if(!gradingDirty) renderGrading(d);
+
   document.getElementById('qs').innerHTML = d.questions.map((q,i) =>
-    '<p><b>' + (i+1) + '. ' + q.text + '</b>' +
-    (q.type==='single' ? '<br>' + q.options.map((o,j)=> (j===q.answer?'✅ ':'　') + o).join('<br>') : ' <i>(简答题, 不自动判分)</i>') + '</p>'
+    '<p><b>' + (i+1) + '. ' + escapeHtml(q.text) + '</b>' +
+    (q.type==='single' ? '<br>' + q.options.map((o,j)=> (j===q.answer?'✅ ':'　') + escapeHtml(o)).join('<br>')
+                       : ' <i>(简答题, 满分 ' + pointsOf(q) + ' 分, 人工评分)</i>') + '</p>'
   ).join('');
+
   // 每题统计按原始题号(第 N 题即建卷时的顺序), 与学生端各自的打乱顺序无关
   const statById = {};
   (d.question_stats || []).forEach(st => statById[st.id] = st);
@@ -731,18 +994,74 @@ async function refresh(){
     if(q.type === 'single'){
       const n = st.graded_count || 0;
       const rate = n ? Math.round((st.correct||0) / n * 100) + '%' : '-';
-      body = q.options.map((o,j) => '　' + (j===q.answer?'✅':'　') + ' ' + o + ': <b>' + ((st.option_counts||[])[j]||0) + '</b> 人' +
+      body = q.options.map((o,j) => '　' + (j===q.answer?'✅':'　') + ' ' + escapeHtml(o) + ': <b>' + ((st.option_counts||[])[j]||0) + '</b> 人' +
              (j===q.answer ? '（正确）' : '')).join('<br>') +
              '<br>已答 ' + (st.answered||0) + '/' + n + ' 份 · 正确率 ' + rate;
     } else {
-      body = '已交卷中作答 ' + (st.answered||0) + ' 份（简答题需人工评阅）';
+      body = '已交卷中作答 ' + (st.answered||0) + ' 份 · 已评 ' + (st.graded||0) + ' 份' +
+             (st.avg_score === null || st.avg_score === undefined ? '' : ' · 平均 ' + st.avg_score + ' 分');
     }
     return '<p style="border-top:1px solid #eee;padding-top:8px"><b>第 ' + (i+1) + ' 题</b> ' + escapeHtml(q.text) + '<br>' + body + '</p>';
   }).join('');
 }
+
+function renderGrading(d){
+  const textQs = d.questions.filter(q => q.type !== 'single');
+  document.getElementById('gradingTitle').style.display = textQs.length ? 'block' : 'none';
+  const box = document.getElementById('grading');
+  if(!textQs.length){ box.innerHTML = ''; return; }
+  let html = '';
+  d.attempts.forEach(a => {
+    if(a.status !== 'submitted' && a.status !== 'expired') return;
+    html += '<div class="panel"><b>' + escapeHtml(a.student) + '</b> ' +
+      '<span style="color:#6b7280">(' + STATUS[a.status] + ' · 客观题 ' + (a.score || 0) + ' 分 · 当前总分 ' + a.total_score + ')</span>';
+    textQs.forEach(q => {
+      const g = (a.grading || {})[q.id] || {};
+      const ans = (a.answers || {})[q.id];
+      html += '<div style="border-top:1px solid #eee;margin-top:8px;padding-top:8px">' +
+        '<div><b>' + escapeHtml(q.text) + '</b>(满分 ' + pointsOf(q) + ' 分)</div>' +
+        '<div class="ans">' + (ans ? escapeHtml(ans) : '<i>未作答</i>') + '</div>' +
+        '得分 <input type="number" min="0" max="' + pointsOf(q) + '" id="sc-' + a.token + '-' + q.id + '"' +
+          ' value="' + (g.score === undefined ? '' : g.score) + '" oninput="gradingDirty=true"> ' +
+        '评语 <input type="text" id="cm-' + a.token + '-' + q.id + '" style="width:55%"' +
+          ' value="' + escapeHtml(g.comment || '') + '" oninput="gradingDirty=true"></div>';
+    });
+    html += '<div style="margin-top:8px"><button onclick="saveGrades(\\'' + a.token + '\\')">保存该生评分</button> ' +
+      '<span id="msg-' + a.token + '" style="color:#dc2626"></span></div></div>';
+  });
+  box.innerHTML = html || '<p>还没有已收卷的答卷。</p>';
+}
+
+async function saveGrades(token){
+  const textQs = EXAM.questions.filter(q => q.type !== 'single');
+  const grades = {};
+  for(const q of textQs){
+    const sc = document.getElementById('sc-' + token + '-' + q.id).value;
+    const cm = document.getElementById('cm-' + token + '-' + q.id).value;
+    if(sc === '' && !cm) continue;              // 没填的题保持原样
+    if(sc === ''){ alert('请给「' + q.text + '」填得分(0~' + pointsOf(q) + ')'); return; }
+    grades[q.id] = {score: parseFloat(sc), comment: cm};
+  }
+  if(!Object.keys(grades).length){ alert('没有需要保存的评分'); return; }
+  const r = await fetch('/api/exams/' + EXAM_ID + '/grade', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: token, grades: grades}),
+  });
+  const d = await r.json();
+  if(!r.ok){ alert(d.error || '评分失败'); return; }
+  gradingDirty = false;
+  refresh();
+}
+
 async function publishExam(){
   if(!confirm('发布后学生即可进场, 且题目不能再修改。确认发布?')) return;
   const r = await fetch('/api/exams/' + EXAM_ID + '/publish', {method: 'POST'});
+  if(r.ok) refresh(); else alert('发布失败');
+}
+
+async function publishResults(){
+  if(!confirm('发布后学生即可看到各自的总分/各题得分/评语。确认发布成绩?')) return;
+  const r = await fetch('/api/exams/' + EXAM_ID + '/publish-results', {method: 'POST'});
   if(r.ok) refresh(); else alert('发布失败');
 }
 refresh(); setInterval(refresh, 4000);

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""端到端验收: 建一场考试, 两个学生并发答完交卷, 并覆盖续答/幂等/超时强收。"""
+"""端到端验收: 混合题型(单选+简答)考试全流程 —— 交卷即判客观题、老师评简答、发布成绩后学生查分。"""
+import json
 import os
 import tempfile
 
@@ -28,7 +29,7 @@ def make_exam(client, duration=60, students=("张三", "李四"), publish=True):
              "options": ["红色", "绿色", "黄色"], "answer": 1},
             {"id": "q2", "text": "发生火灾时能否乘坐电梯逃生?", "type": "single",
              "options": ["能", "不能"], "answer": 1},
-            {"id": "q3", "text": "简述你所在岗位的疏散路线。", "type": "text"},
+            {"id": "q3", "text": "简述你所在岗位的疏散路线。", "type": "text", "points": 5},
         ],
         "students": list(students),
     })
@@ -45,7 +46,13 @@ def token_of(exam, name):
     return next(l["url"].split("/s/")[1] for l in exam["links"] if l["student"] == name)
 
 
-# ---------- 场景1: 两个学生并发答题、刷新续答、交卷且重复提交幂等 ----------
+def release_results(client, exam_id):
+    r = client.post(f"/api/exams/{exam_id}/publish-results")
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()
+
+
+# ---------- 场景1: 两人并发答题交卷 -> 老师评简答 -> 发布成绩 -> 学生各看各的 ----------
 client = app.test_client()
 exam = make_exam(client)
 tokens = {n: token_of(exam, n) for n in ("张三", "李四")}
@@ -72,27 +79,72 @@ def student_flow(name, final_answers):
 
 threads = [threading.Thread(target=student_flow, args=(n, a)) for n, a in [
     ("张三", {"q1": 1, "q2": 1, "q3": "走东侧楼梯下楼到广场集合"}),
-    ("李四", {"q1": 0, "q2": 1, "q3": "坐电梯"}, ),
+    ("李四", {"q1": 0, "q2": 1, "q3": "坐电梯"}),
 ]]
 for t in threads: t.start()
 for t in threads: t.join()
 
 check("两个学生并发完成答题交卷", len(outcomes) == 2)
-check("张三全对得 2 分", outcomes["张三"][0].get("score") == 2, str(outcomes["张三"]))
-check("李四答错一题得 1 分", outcomes["李四"][0].get("score") == 1, str(outcomes["李四"]))
-check("重复提交返回 duplicate 且分数不变",
-      all(o[1].get("duplicate") and o[1].get("score") == o[0].get("score") for o in outcomes.values()))
+check("交卷响应不提前泄露分数(成绩未发布)",
+      all("score" not in o[0] and "score" not in o[1] for o in outcomes.values()), str(outcomes))
+check("重复提交返回 duplicate", all(o[1].get("duplicate") for o in outcomes.values()), str(outcomes))
 
 with db() as conn:
     rows = conn.execute("SELECT token, status, score FROM attempts").fetchall()
 check("数据库中每人只有一条答卷记录", len(rows) == 2, str([dict(r) for r in rows]))
 check("两条记录均为已交卷", all(r["status"] == "submitted" for r in rows))
 
-r = client.get(f"/api/exams/{exam['exam_id']}").get_json()
-check("老师后台看到 2 份已交卷",
-      sorted(a["status"] for a in r["attempts"]) == ["submitted", "submitted"], str(r["attempts"]))
+# 成绩发布前: 学生刷新自己的链接也看不到任何分数
+s = client.get(f"/api/s/{tokens['张三']}/state").get_json()
+check("发布成绩前学生端看不到分数和明细", s.get("score") is None and "result" not in s, str(s.get("score")))
 
-# ---------- 场景2: 到点强制收卷, 超时后不能再改答案 ----------
+# 老师后台: 客观题已判, 简答题待评, 能看到学生简答内容
+d = client.get(f"/api/exams/{exam['exam_id']}").get_json()
+att = {a["student"]: a for a in d["attempts"]}
+check("老师看到客观题得分(张三2/李四1)", att["张三"]["score"] == 2 and att["李四"]["score"] == 1, str(att))
+check("简答题待评分各 1 道", att["张三"]["pending_count"] == 1 and att["李四"]["pending_count"] == 1)
+check("老师能看到学生简答内容以便评分",
+      att["张三"]["answers"].get("q3") == "走东侧楼梯下楼到广场集合", str(att["张三"]["answers"]))
+check("成绩未发布标记正确", d.get("results_published") is False)
+
+# 老师评分+评语; 重复评分幂等; 改分直接覆盖
+grade1 = lambda tok, grades: client.post(f"/api/exams/{exam['exam_id']}/grade",
+                                         json={"token": tok, "grades": grades})
+r1 = grade1(tokens["张三"], {"q3": {"score": 5, "comment": "路线清晰"}}).get_json()
+r2 = grade1(tokens["张三"], {"q3": {"score": 5, "comment": "路线清晰"}}).get_json()
+check("评分成功且重复评分幂等(张三 2+5=7 不变)",
+      r1.get("total_score") == 7 and r2.get("total_score") == 7 and r2.get("ok"), f"{r1} {r2}")
+r3 = grade1(tokens["李四"], {"q3": {"score": 2, "comment": "不能坐电梯"}}).get_json()
+r4 = grade1(tokens["李四"], {"q3": {"score": 3, "comment": "不能坐电梯, 扣两分"}}).get_json()
+check("改分直接覆盖(李四 1+2=3 -> 1+3=4)", r3.get("total_score") == 3 and r4.get("total_score") == 4,
+      f"{r3} {r4}")
+
+# 评完分但没发布成绩, 学生仍然看不到
+s = client.get(f"/api/s/{tokens['张三']}/state").get_json()
+check("评分后未发布学生仍看不到分数", s.get("score") is None and "result" not in s)
+
+# 发布成绩(重复发布幂等)
+p1 = release_results(client, exam["exam_id"])
+p2 = release_results(client, exam["exam_id"])
+check("发布成绩成功且重复发布幂等", p1.get("ok") and not p1.get("already") and p2.get("already"), f"{p1} {p2}")
+
+# 学生刷新自己的链接: 看到本人总分/各题得分/评语
+s = client.get(f"/api/s/{tokens['张三']}/state").get_json()
+check("发布后张三看到总分 7", s.get("score") == 7, str(s.get("score")))
+items = {it["id"]: it for it in s["result"]["items"]}
+check("各题得分正确(客观1/1+1/1, 简答5/5)",
+      items["q1"]["score"] == 1 and items["q2"]["score"] == 1 and items["q3"]["score"] == 5
+      and items["q1"]["max_score"] == 1 and items["q3"]["max_score"] == 5, str(items))
+check("张三看到老师评语", items["q3"]["comment"] == "路线清晰", str(items["q3"]))
+check("成绩明细不含正确答案", all("answer" not in it for it in s["result"]["items"]))
+check("发布后下发题目仍不含正确答案", all("answer" not in q for q in s["questions"]))
+s4 = client.get(f"/api/s/{tokens['李四']}/state").get_json()
+check("李四看到自己总分 4", s4.get("score") == 4, str(s4.get("score")))
+check("张三的成绩页不含李四的任何信息", "李四" not in json.dumps(s, ensure_ascii=False))
+r = client.post(f"/api/s/{tokens['张三']}/submit", json={"answers": {}}).get_json()
+check("发布后重复交卷幂等返回本人总分", r.get("duplicate") and r.get("score") == 7, str(r))
+
+# ---------- 场景2: 到点强制收卷, 客观题即判, 简答补评后发布 ----------
 exam2 = make_exam(client, duration=2, students=("王五",))
 tok = token_of(exam2, "王五")
 c = app.test_client()
@@ -101,15 +153,30 @@ c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1, "q3": "没�
 time.sleep(2.5)
 s = c.get(f"/api/s/{tok}/state").get_json()
 check("超时后自动强制收卷", s["status"] == "expired", s["status"])
-check("强收用已保存答案判分(2分)", s["score"] == 2, str(s.get("score")))
+check("强收后未发布成绩学生看不到分", s.get("score") is None and "result" not in s)
 r = c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 0}, "rev": 2})
 check("超时后保存答案被拒绝", r.status_code == 409)
 r = c.post(f"/api/s/{tok}/submit", json={"answers": {"q1": 0, "q2": 0}})
-check("超时后补交不能改答案(幂等返回原结果)",
-      r.get_json().get("duplicate") and r.get_json().get("score") == 2, str(r.get_json()))
+check("超时后补交幂等且不泄露分数",
+      r.get_json().get("duplicate") and "score" not in r.get_json(), str(r.get_json()))
 with db() as conn:
     n = conn.execute("SELECT COUNT(*) c FROM attempts WHERE exam_id=?", (exam2["exam_id"],)).fetchone()["c"]
 check("超时场景也只有一条记录", n == 1)
+
+d = client.get(f"/api/exams/{exam2['exam_id']}").get_json()
+a = d["attempts"][0]
+check("强收卷客观题已判(2分)且简答待评", a["score"] == 2 and a["pending_count"] == 1, str(a))
+r = client.post(f"/api/exams/{exam2['exam_id']}/grade",
+                json={"token": tok, "grades": {"q3": {"score": 4, "comment": "基本正确"}}})
+check("超时强收的卷子仍可补评简答(2+4=6)",
+      r.status_code == 200 and r.get_json()["total_score"] == 6, f"{r.status_code} {r.get_json()}")
+release_results(client, exam2["exam_id"])
+s = c.get(f"/api/s/{tok}/state").get_json()
+items = {it["id"]: it for it in s["result"]["items"]}
+check("发布后王五看到总分 6 和评语",
+      s.get("score") == 6 and items["q3"]["comment"] == "基本正确", str(s.get("score")))
+r = c.post(f"/api/s/{tok}/submit", json={"answers": {"q1": 0}}).get_json()
+check("发布后重复交卷返回总分 6", r.get("duplicate") and r.get("score") == 6, str(r))
 
 # ---------- 场景3: 未开始的考试不能被"强制超时收卷" ----------
 exam3 = make_exam(client, students=("赵六",))
@@ -121,7 +188,12 @@ check("未开始时交卷被拒绝(409)", r.status_code == 409 and r.get_json().
 s = c.get(f"/api/s/{tok3}/state").get_json()
 check("之后首次打开仍能正常开考", s["status"] == "in_progress" and s["remaining_seconds"] > 0, str(s["status"]))
 r = c.post(f"/api/s/{tok3}/submit", json={"answers": {"q1": 1, "q2": 1}}).get_json()
-check("开考后正常交卷判分(2分)", r.get("status") == "submitted" and r.get("score") == 2, str(r))
+check("开考后正常交卷(响应不含分数)", r.get("status") == "submitted" and "score" not in r, str(r))
+release_results(client, exam3["exam_id"])
+s = c.get(f"/api/s/{tok3}/state").get_json()
+items = {it["id"]: it for it in s["result"]["items"]}
+check("发布后看到总分(客观2分, 简答未评按0)",
+      s.get("score") == 2 and items["q3"]["score"] is None, str(s.get("score")))
 
 # ---------- 场景4: 自动保存乱序到达, 旧请求不能覆盖新答案 ----------
 exam4 = make_exam(client, students=("孙七",))
@@ -147,7 +219,7 @@ check("更高 rev 保存正常生效", not r5.get("stale") and s["answers"] == {
 r6 = c.post(f"/api/s/{tok4}/answers", json={"answers": {"q1": 1}})  # 缺 rev
 check("缺少 rev 的保存被拒绝(400)", r6.status_code == 400)
 
-# ---------- 场景5: 草稿 -> 校对 -> 发布, 发布后不可改 ----------
+# ---------- 场景5: 草稿 -> 校对 -> 发布; 草稿不能评分/发成绩 ----------
 exam5 = make_exam(client, students=("周九",), publish=False)
 tok5 = token_of(exam5, "周九")
 c = app.test_client()
@@ -157,6 +229,10 @@ with db() as conn:
     st = conn.execute("SELECT status FROM attempts WHERE token=?", (tok5,)).fetchone()["status"]
 check("草稿期打开链接不会启动计时", st == "not_started", st)
 check("草稿期交卷被拒绝", c.post(f"/api/s/{tok5}/submit", json={"answers": {}}).status_code == 409)
+check("草稿不能发布成绩(409)",
+      c.post(f"/api/exams/{exam5['exam_id']}/publish-results").status_code == 409)
+r = c.post(f"/api/exams/{exam5['exam_id']}/grade", json={"token": tok5, "grades": {}})
+check("草稿不能评分(409)", r.status_code == 409, f"{r.status_code}")
 
 # 校对发现问题: 改题 + 加学生(草稿可改)
 r = c.put(f"/api/exams/{exam5['exam_id']}", json={
@@ -184,7 +260,10 @@ check("发布后学生正常进场计时", s["status"] == "in_progress" and s["r
 check("发布后自动保存照常",
       c.post(f"/api/s/{tok5}/answers", json={"answers": {"q1": 0}, "rev": 1}).get_json().get("ok") is True)
 r = c.post(f"/api/s/{tok5}/submit", json={"answers": {"q1": 0}}).get_json()
-check("发布后交卷判分照常(1分)", r.get("status") == "submitted" and r.get("score") == 1, str(r))
+check("交卷成功但响应不含分数", r.get("status") == "submitted" and "score" not in r, str(r))
+release_results(client, exam5["exam_id"])
+s = c.get(f"/api/s/{tok5}/state").get_json()
+check("纯客观考试发布成绩后学生看到 1 分", s.get("score") == 1, str(s.get("score")))
 
 # ---------- 场景6: 每人题目顺序不同, 但自己刷新不变; 老师视角按原题号 ----------
 import random as _random
@@ -233,7 +312,6 @@ for name in ("甲", "乙"):
           f"{orders[name]} vs {[q['id'] for q in again['questions']]}")
 
 # 按各自打乱后的显示位置作答, 判分仍按题目 id 走, 不能对错号
-# 构造"全对": 按每题在该学生页面上的位置选正确选项
 def correct_answers_in_display_order(s):
     text_to_correct = {"题一": 0, "题二": 1, "题三": 0, "题四": 1}
     return {q["id"]: text_to_correct[q["text"]] for q in s["questions"]}
@@ -242,7 +320,7 @@ s = states["丙"]
 ans = correct_answers_in_display_order(s)
 client.post(f"/api/s/{token_of(exam6, '丙')}/answers", json={"answers": ans, "rev": 1})
 sub = client.post(f"/api/s/{token_of(exam6, '丙')}/submit", json={"answers": ans}).get_json()
-check("题序打乱后按页面作答判分仍正确(4分)", sub.get("score") == 4, str(sub))
+check("交卷响应不含分数(未发布成绩)", "score" not in sub, str(sub))
 
 # 乙故意全错 -> 0 分; 丁只答对两题 -> 2 分
 s = states["乙"]
@@ -253,6 +331,16 @@ all_correct = {"题一": 0, "题二": 1, "题三": 0, "题四": 1}
 half = {q["id"]: (all_correct[q["text"]] if q["text"] in ("题一", "题二") else 1 - all_correct[q["text"]])
         for q in s["questions"]}
 client.post(f"/api/s/{token_of(exam6, '丁')}/submit", json={"answers": half})
+
+release_results(client, exam6["exam_id"])
+s = client.get(f"/api/s/{token_of(exam6, '丙')}/state").get_json()
+check("题序打乱后按页面作答判分仍正确(4分)", s.get("score") == 4, str(s.get("score")))
+check("丙的成绩明细顺序与本人题序一致",
+      [it["id"] for it in s["result"]["items"]] == orders["丙"], str(orders["丙"]))
+s = client.get(f"/api/s/{token_of(exam6, '乙')}/state").get_json()
+check("乙全错 0 分", s.get("score") == 0, str(s.get("score")))
+s = client.get(f"/api/s/{token_of(exam6, '丁')}/state").get_json()
+check("丁答对两题 2 分", s.get("score") == 2, str(s.get("score")))
 
 d = client.get(f"/api/exams/{exam6['exam_id']}").get_json()
 check("老师后台题目仍是原始题号顺序",
@@ -306,9 +394,12 @@ r = c.post(f"/api/s/{tok}/submit", json={"answers": ["非法"]})
 check("非法交卷被拒(400)", r.status_code == 400, f"{r.status_code}")
 s = c.get(f"/api/s/{tok}/state").get_json()
 check("被拒后已保存的答案仍在", s["answers"] == {"q1": 1, "q2": 1}, str(s["answers"]))
-# 改成合法格式重新交卷 -> 正常判分
+# 改成合法格式重新交卷 -> 正常收卷
 r1 = c.post(f"/api/s/{tok}/submit", json={"answers": {"q1": 1, "q2": 1}}).get_json()
-check("修正格式后正常交卷判分(2分)", r1.get("status") == "submitted" and r1.get("score") == 2, str(r1))
+check("修正格式后正常交卷", r1.get("status") == "submitted" and "score" not in r1, str(r1))
+release_results(client, exam8["exam_id"])
+s = c.get(f"/api/s/{tok}/state").get_json()
+check("发布成绩后查到 2 分", s.get("score") == 2, str(s.get("score")))
 # 再重复交(即便这次带着非法答案)也应幂等返回原结果, 不报错、不改分
 r2 = c.post(f"/api/s/{tok}/submit", json={"answers": ["非法"]}).get_json()
 check("收卷后重复交卷幂等(非法体也不改结果)",
@@ -328,9 +419,12 @@ try:
 finally:
     _app_mod.SUBMIT_GRACE_SECONDS = 5
 d = r.get_json()
-check("超时后非法交卷体不影响强收(200/expired/2分)",
-      r.status_code == 200 and d.get("status") == "expired" and d.get("score") == 2,
+check("超时后非法交卷体不影响强收(200/expired/不泄露分数)",
+      r.status_code == 200 and d.get("status") == "expired" and "score" not in d,
       f"{r.status_code} {d}")
+release_results(client, exam8b["exam_id"])
+s = c.get(f"/api/s/{tok}/state").get_json()
+check("强收卷发布后查到客观 2 分", s.get("score") == 2, str(s.get("score")))
 
 # 缺省 answers 字段仍允许: 用已自动保存的答案交卷(老行为不变)
 exam8c = make_exam(client, students=("褚十三",))
@@ -339,8 +433,139 @@ c = app.test_client()
 c.get(f"/api/s/{tok}/state")
 c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1}, "rev": 1})
 r = c.post(f"/api/s/{tok}/submit", json={})
-check("不带 answers 交卷沿用已保存答案(2分)",
-      r.status_code == 200 and r.get_json().get("score") == 2, f"{r.status_code} {r.get_json()}")
+check("不带 answers 交卷沿用已保存答案", r.status_code == 200 and r.get_json().get("status") == "submitted",
+      f"{r.status_code} {r.get_json()}")
+release_results(client, exam8c["exam_id"])
+s = c.get(f"/api/s/{tok}/state").get_json()
+check("发布后查到 2 分", s.get("score") == 2, str(s.get("score")))
+
+# ---------- 场景9: 简答题评分校验 / 成绩发布边界 / 学生间隔离 ----------
+exam9 = make_exam(client, students=("小明", "小红"))
+tok_m, tok_h = token_of(exam9, "小明"), token_of(exam9, "小红")
+gid = exam9["exam_id"]
+grade9 = lambda tok, grades: client.post(f"/api/exams/{gid}/grade", json={"token": tok, "grades": grades})
+
+r = grade9(tok_m, {"q3": {"score": 3}})
+check("未交卷不能评分(409)", r.status_code == 409, f"{r.status_code} {r.get_json()}")
+r = grade9("不存在的token", {"q3": {"score": 3}})
+check("未知答卷评分返回 404", r.status_code == 404, f"{r.status_code}")
+
+c = app.test_client()
+c.get(f"/api/s/{tok_m}/state")
+c.post(f"/api/s/{tok_m}/submit", json={"answers": {"q1": 1, "q2": 1, "q3": "走消防通道"}})
+
+bad_grades = [
+    ({"q3": {"score": 6}}, "超过满分"),
+    ({"q3": {"score": -1}}, "负分"),
+    ({"q3": {"score": "4"}}, "分数是字符串"),
+    ({"q3": {"score": True}}, "分数是布尔"),
+    ({"q1": {"score": 1}}, "给单选题评分"),
+    ({"q9": {"score": 1}}, "不存在的题"),
+    ({"q3": {"score": 4, "comment": 123}}, "评语不是字符串"),
+    ({"q3": "4"}, "评分项不是对象"),
+]
+for grades, desc in bad_grades:
+    r = grade9(tok_m, grades)
+    check(f"非法评分被拒({desc}, 400)", r.status_code == 400, f"{r.status_code} {r.get_json()}")
+
+r = grade9(tok_m, {"q3": {"score": 4, "comment": "要点齐全"}}).get_json()
+check("正常评分(客观2+简答4=6)", r.get("total_score") == 6 and r.get("pending_count") == 0, str(r))
+r = grade9(tok_m, {"q3": {"score": 4, "comment": "要点齐全"}}).get_json()
+check("重复评分幂等(总分仍 6)", r.get("total_score") == 6, str(r))
+r = grade9(tok_m, {"q3": {"score": 5, "comment": "复评上调"}}).get_json()
+check("改分覆盖(总分 7)", r.get("total_score") == 7, str(r))
+
+# 另一份答卷的评分互不影响
+c2 = app.test_client()
+c2.get(f"/api/s/{tok_h}/state")
+c2.post(f"/api/s/{tok_h}/submit", json={"answers": {"q1": 0, "q2": 0, "q3": "不知道"}})
+r = grade9(tok_h, {"q3": {"score": 1, "comment": "疏散常识薄弱"}}).get_json()
+check("各答卷评分互不影响(小红 0+1=1)", r.get("total_score") == 1, str(r))
+
+# 未发布成绩: 两个学生都看不到任何分数
+ok_gate = True
+for t in (tok_m, tok_h):
+    s = app.test_client().get(f"/api/s/{t}/state").get_json()
+    ok_gate = ok_gate and s.get("score") is None and "result" not in s
+check("未发布前所有学生都看不到分数", ok_gate)
+
+p1 = release_results(client, gid)
+p2 = release_results(client, gid)
+check("发布成绩幂等", p1.get("ok") and not p1.get("already") and p2.get("already"), f"{p1} {p2}")
+
+s = app.test_client().get(f"/api/s/{tok_m}/state").get_json()
+check("小明看到自己总分 7", s.get("score") == 7, str(s.get("score")))
+check("小明的页面不含小红的信息", "小红" not in json.dumps(s, ensure_ascii=False))
+s = app.test_client().get(f"/api/s/{tok_h}/state").get_json()
+check("小红看到自己总分 1", s.get("score") == 1, str(s.get("score")))
+check("小红的页面不含小明的信息", "小明" not in json.dumps(s, ensure_ascii=False))
+
+# 发布后再改分, 学生刷新看到更新
+r = grade9(tok_m, {"q3": {"score": 3, "comment": "复核后调整"}}).get_json()
+check("发布后仍可改分(总分 5)", r.get("total_score") == 5, str(r))
+s = app.test_client().get(f"/api/s/{tok_m}/state").get_json()
+items = {it["id"]: it for it in s["result"]["items"]}
+check("学生刷新看到更新后的分数和评语",
+      s.get("score") == 5 and items["q3"]["comment"] == "复核后调整", str(s.get("score")))
+
+# ---------- 场景10: 旧版数据库兼容(无新列的老库迁移后照常工作) ----------
+import sqlite3 as _sqlite3
+
+legacy_db = os.path.join(tempfile.mkdtemp(), "legacy.db")
+conn = _sqlite3.connect(legacy_db)
+conn.executescript("""
+CREATE TABLE exams (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, duration_seconds INTEGER NOT NULL,
+    questions TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'published',
+    published_at REAL, created_at REAL NOT NULL
+);
+CREATE TABLE attempts (
+    token TEXT PRIMARY KEY, exam_id TEXT NOT NULL, student_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'not_started', started_at REAL, deadline REAL,
+    answers TEXT NOT NULL DEFAULT '{}', answers_rev INTEGER NOT NULL DEFAULT 0,
+    question_order TEXT, score INTEGER, submitted_at REAL
+);
+""")
+now = time.time()
+conn.execute("INSERT INTO exams VALUES(?,?,?,?,?,?,?)",
+             ("legacy01", "旧版考试", 60, json.dumps([
+                 {"id": "q1", "text": "1+1=?", "type": "single", "options": ["2", "3"], "answer": 0},
+                 {"id": "q2", "text": "简述疏散路线", "type": "text"},   # 老数据: 没有 points 字段
+             ], ensure_ascii=False), "published", now, now))
+conn.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+             ("legtok1", "legacy01", "老生", "submitted", now - 600, now - 540,
+              json.dumps({"q1": 0, "q2": "走楼梯"}, ensure_ascii=False), 3, None, 1, now - 540))
+conn.commit()
+conn.close()
+
+import app as app_mod
+orig_db = app_mod.DB_PATH
+app_mod.DB_PATH = legacy_db
+try:
+    app_mod.init_db()   # 老库补列迁移, 不应报错
+    lc = app.test_client()
+    s = lc.get("/api/s/legtok1/state").get_json()
+    check("旧库迁移后学生端正常返回", s.get("status") == "submitted", str(s))
+    check("旧考试未发布成绩前学生看不到分", s.get("score") is None and "result" not in s, str(s.get("score")))
+    check("旧考试学生端仍拿不到正确答案", all("answer" not in q for q in s["questions"]))
+    d = lc.get("/api/exams/legacy01").get_json()
+    a = d["attempts"][0]
+    check("旧答卷客观分/总分/待评兼容",
+          a["score"] == 1 and a["total_score"] == 1 and a["pending_count"] == 1, str(a))
+    r = lc.post("/api/exams/legacy01/grade",
+                json={"token": "legtok1", "grades": {"q2": {"score": 4, "comment": "不错"}}})
+    check("旧考试的简答题可补评(默认满分5, 总分 1+4=5)",
+          r.status_code == 200 and r.get_json()["total_score"] == 5, f"{r.status_code} {r.get_json()}")
+    r = lc.post("/api/exams/legacy01/grade", json={"token": "legtok1", "grades": {"q2": {"score": 6}}})
+    check("旧简答题按默认满分 5 校验(6 分被拒)", r.status_code == 400, f"{r.status_code}")
+    lc.post("/api/exams/legacy01/publish-results")
+    s = lc.get("/api/s/legtok1/state").get_json()
+    check("旧考试发布成绩后学生看到总分 5", s.get("score") == 5, str(s.get("score")))
+    items = {it["id"]: it for it in s["result"]["items"]}
+    check("旧简答题按默认满分 5 展示",
+          items["q2"]["max_score"] == 5 and items["q2"]["score"] == 4, str(items))
+finally:
+    app_mod.DB_PATH = orig_db
 
 print()
 failed = [n for n, ok, _ in results if not ok]
