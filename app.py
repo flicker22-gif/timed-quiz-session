@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS exams (
     title            TEXT NOT NULL,
     duration_seconds INTEGER NOT NULL,
     questions        TEXT NOT NULL,           -- JSON 数组
+    status           TEXT NOT NULL DEFAULT 'draft',  -- draft/published; 发布后不可改题、不可撤回
+    published_at     REAL,
     created_at       REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attempts (
@@ -57,7 +59,13 @@ def db():
 def init_db():
     with db() as conn:
         conn.executescript(SCHEMA)
-        # 老库补列(简单迁移)
+        # 老库补列(简单迁移); 存量考试已在用, 视为已发布
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(exams)")]
+        if "status" not in cols:
+            conn.execute("ALTER TABLE exams ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'")
+            conn.execute("UPDATE exams SET status='published'")
+        if "published_at" not in cols:
+            conn.execute("ALTER TABLE exams ADD COLUMN published_at REAL")
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(attempts)")]
         if "answers_rev" not in cols:
             conn.execute("ALTER TABLE attempts ADD COLUMN answers_rev INTEGER NOT NULL DEFAULT 0")
@@ -110,23 +118,35 @@ def get_attempt(conn, token):
 
 # ---------------- API ----------------
 
-@app.post("/api/exams")
-def create_exam():
-    """创建考试。body: {title, duration_seconds, questions:[...], students:[名字,...]}"""
-    data = parse_body()
+def validate_exam_payload(data):
+    """返回 (title, duration, questions, students), 不合法返回 None。"""
     title = (data.get("title") or "").strip()
-    duration = int(data.get("duration_seconds") or 0)
+    try:
+        duration = int(data.get("duration_seconds") or 0)
+    except (TypeError, ValueError):
+        return None
     questions = data.get("questions") or []
     students = [s.strip() for s in (data.get("students") or []) if s.strip()]
     if not title or duration <= 0 or not questions or not students:
+        return None
+    return title, duration, questions, students
+
+
+@app.post("/api/exams")
+def create_exam():
+    """创建考试(草稿)。body: {title, duration_seconds, questions:[...], students:[名字,...]}"""
+    payload = validate_exam_payload(parse_body())
+    if not payload:
         return jsonify(error="需要 title / duration_seconds / questions / students"), 400
+    title, duration, questions, students = payload
 
     exam_id = uuid.uuid4().hex[:8]
     now = time.time()
     links = []
     with db() as conn:
         conn.execute(
-            "INSERT INTO exams(id, title, duration_seconds, questions, created_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO exams(id, title, duration_seconds, questions, status, created_at) "
+            "VALUES(?,?,?,?,'draft',?)",
             (exam_id, title, duration, json.dumps(questions, ensure_ascii=False), now),
         )
         for name in students:
@@ -136,7 +156,67 @@ def create_exam():
                 (token, exam_id, name),
             )
             links.append({"student": name, "url": f"/s/{token}"})
-    return jsonify(exam_id=exam_id, teacher_url=f"/exam/{exam_id}", links=links)
+    return jsonify(exam_id=exam_id, status="draft", teacher_url=f"/exam/{exam_id}", links=links)
+
+
+@app.put("/api/exams/<exam_id>")
+def update_exam(exam_id):
+    """修改考试。仅草稿状态可用; 已发布的考试不能改题、加人、减人。"""
+    payload = validate_exam_payload(parse_body())
+    if not payload:
+        return jsonify(error="需要 title / duration_seconds / questions / students"), 400
+    title, duration, questions, students = payload
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        exam = get_exam(conn, exam_id)
+        if exam["status"] != "draft":
+            return jsonify(error="已发布的考试不能修改"), 409
+        conn.execute(
+            "UPDATE exams SET title=?, duration_seconds=?, questions=? WHERE id=?",
+            (title, duration, json.dumps(questions, ensure_ascii=False), exam_id),
+        )
+        # 同步学生名单: 新增的补发 token, 移除的删掉未开始的答卷
+        existing = {
+            r["student_name"]: r["token"]
+            for r in conn.execute("SELECT student_name, token FROM attempts WHERE exam_id=?", (exam_id,))
+        }
+        for name in existing:
+            if name not in students:
+                conn.execute(
+                    "DELETE FROM attempts WHERE exam_id=? AND student_name=?", (exam_id, name)
+                )
+        for name in students:
+            if name not in existing:
+                conn.execute(
+                    "INSERT INTO attempts(token, exam_id, student_name) VALUES(?,?,?)",
+                    (secrets.token_urlsafe(8), exam_id, name),
+                )
+        links = [
+            {"student": r["student_name"], "url": f"/s/{r['token']}"}
+            for r in conn.execute(
+                "SELECT student_name, token FROM attempts WHERE exam_id=? ORDER BY student_name",
+                (exam_id,),
+            )
+        ]
+        return jsonify(
+            exam_id=exam_id, status="draft", teacher_url=f"/exam/{exam_id}", links=links
+        )
+
+
+@app.post("/api/exams/<exam_id>/publish")
+def publish_exam(exam_id):
+    """发布考试(幂等)。发布后学生链接才能进场计时; 没有对应的撤回接口。"""
+    now = time.time()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        exam = get_exam(conn, exam_id)
+        if exam["status"] == "published":
+            return jsonify(ok=True, already=True, status="published")
+        conn.execute(
+            "UPDATE exams SET status='published', published_at=? WHERE id=? AND status='draft'",
+            (now, exam_id),
+        )
+        return jsonify(ok=True, already=False, status="published")
 
 
 @app.get("/api/exams/<exam_id>")
@@ -158,6 +238,8 @@ def exam_detail(exam_id):
             exam_id=exam_id,
             title=exam["title"],
             duration_seconds=exam["duration_seconds"],
+            status=exam["status"],
+            published_at=exam["published_at"],
             questions=json.loads(exam["questions"]),
             attempts=[
                 {
@@ -182,6 +264,10 @@ def student_state(token):
         conn.execute("BEGIN IMMEDIATE")
         attempt = get_attempt(conn, token)
         exam = get_exam(conn, attempt["exam_id"])
+
+        if exam["status"] != "published":
+            # 草稿/未发布: 学生不能进场, 更不会启动计时
+            return jsonify(error="考试尚未发布", status=exam["status"]), 403
 
         if attempt["status"] == "not_started":
             # 首次打开: 启动计时, 截止时间以服务器为准
@@ -290,7 +376,7 @@ INDEX_HTML = """<!doctype html>
  .row{display:flex;gap:12px}.row>div{flex:1}
  #result{background:#f6f8fa;border-radius:8px;padding:12px;white-space:pre-wrap;word-break:break-all}
 </style></head><body>
-<h2>创建一场限时考试</h2>
+<h2 id="pageTitle">创建一场限时考试</h2>
 <label>考试标题</label><input id="title" placeholder="例如: 9月安全培训测验">
 <label>时长(分钟)</label><input id="duration" type="number" min="1" value="30">
 <label>参加学生(每行一个名字)</label>
@@ -298,12 +384,14 @@ INDEX_HTML = """<!doctype html>
 <h3>题目</h3>
 <div id="questions"></div>
 <button type="button" onclick="addQuestion()">+ 添加题目</button>
-<hr><button type="button" onclick="createExam()">创建考试</button>
-<h3 id="rtitle" style="display:none">学生链接(发给对应学生)</h3>
+<hr><button type="button" id="submitBtn" onclick="saveExam()">保存为草稿</button>
+<h3 id="rtitle" style="display:none">学生链接(发布后才能进场)</h3>
 <div id="result"></div>
 <script>
 let qn = 0;
-function addQuestion(){
+const editId = new URLSearchParams(location.search).get('edit');
+
+function addQuestion(q){
   qn++;
   const d = document.createElement('div');
   d.className = 'q';
@@ -320,8 +408,18 @@ function addQuestion(){
       <label>正确答案(第几个选项, 从1开始)</label><input class="q-answer" type="number" min="1" value="1">
     </div>`;
   document.getElementById('questions').appendChild(d);
+  if(q){
+    d.querySelector('.q-text').value = q.text;
+    d.querySelector('.q-type').value = q.type;
+    d.querySelector('.single-only').style.display = q.type === 'single' ? 'block' : 'none';
+    if(q.type === 'single'){
+      d.querySelector('.q-options').value = (q.options || []).join(', ');
+      d.querySelector('.q-answer').value = (q.answer === undefined ? 0 : q.answer) + 1;
+    }
+  }
 }
-async function createExam(){
+
+async function saveExam(){
   const questions = [];
   document.querySelectorAll('.q').forEach((el, i) => {
     const text = el.querySelector('.q-text').value.trim();
@@ -340,15 +438,31 @@ async function createExam(){
     questions,
     students: document.getElementById('students').value.split('\\n').map(s=>s.trim()).filter(Boolean),
   };
-  const r = await fetch('/api/exams', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const r = await fetch(editId ? '/api/exams/' + editId : '/api/exams', {
+    method: editId ? 'PUT' : 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   const data = await r.json();
-  if(!r.ok){ alert(data.error || '创建失败'); return; }
+  if(!r.ok){ alert(data.error || '保存失败'); return; }
   document.getElementById('rtitle').style.display = 'block';
-  let out = '管理后台: ' + location.origin + data.teacher_url + '\\n\\n';
+  let out = '状态: 草稿 —— 请到管理后台校对, 确认后发布\\n管理后台: ' + location.origin + data.teacher_url + '\\n\\n';
   for(const l of data.links) out += l.student + ': ' + location.origin + l.url + '\\n';
   document.getElementById('result').textContent = out;
 }
-addQuestion();
+
+async function init(){
+  if(!editId){ addQuestion(); return; }
+  const r = await fetch('/api/exams/' + editId);
+  const d = await r.json();
+  if(d.status !== 'draft'){ alert('已发布的考试不能修改'); location.href = '/exam/' + editId; return; }
+  document.getElementById('pageTitle').textContent = '编辑草稿(发布前可反复修改)';
+  document.getElementById('submitBtn').textContent = '保存修改';
+  document.getElementById('title').value = d.title;
+  document.getElementById('duration').value = d.duration_seconds / 60;
+  document.getElementById('students').value = d.attempts.map(a => a.student).join('\\n');
+  document.getElementById('questions').innerHTML = '';
+  d.questions.forEach(q => addQuestion(q));
+}
+init();
 </script></body></html>"""
 
 STUDENT_HTML = """<!doctype html>
@@ -380,6 +494,7 @@ function fmt(s){ s = Math.max(0, s); const m = String(Math.floor(s/60)).padStart
 
 async function load(){
   const r = await fetch('/api/s/' + TOKEN + '/state');
+  if(r.status === 403){ document.body.innerHTML = '<h2>考试尚未发布, 请等老师通知后再打开本链接</h2>'; return; }
   if(!r.ok){ document.body.innerHTML = '<h2>链接无效或考试不存在</h2>'; return; }
   const s = await r.json();
   document.getElementById('title').textContent = s.title;
@@ -497,6 +612,12 @@ TEACHER_HTML = """<!doctype html>
 </style></head><body>
 <h2 id="title"></h2>
 <p id="meta"></p>
+<p id="draftBar" style="display:none;background:#fef3c7;border-radius:8px;padding:10px">
+  <b>草稿状态:</b> 学生链接暂时无法进场。校对无误后
+  <button onclick="publishExam()" style="padding:6px 14px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer">发布考试</button>
+  <a id="editLink" href="#">返回编辑草稿</a>
+  (发布后不能再修改)
+</p>
 <table><thead><tr><th>学生</th><th>状态</th><th>剩余时间</th><th>客观题得分</th><th>答题链接</th></tr></thead>
 <tbody id="rows"></tbody></table>
 <h3>题目与答案</h3><div id="qs"></div>
@@ -508,7 +629,11 @@ async function refresh(){
   const r = await fetch('/api/exams/' + EXAM_ID);
   const d = await r.json();
   document.getElementById('title').textContent = d.title;
-  document.getElementById('meta').textContent = '时长 ' + Math.round(d.duration_seconds/60) + ' 分钟 · 每 4 秒自动刷新';
+  document.getElementById('meta').textContent =
+    '时长 ' + Math.round(d.duration_seconds/60) + ' 分钟 · 状态: ' +
+    (d.status === 'draft' ? '草稿(未发布)' : '已发布') + ' · 每 4 秒自动刷新';
+  document.getElementById('draftBar').style.display = d.status === 'draft' ? 'block' : 'none';
+  document.getElementById('editLink').href = '/?edit=' + EXAM_ID;
   document.getElementById('rows').innerHTML = d.attempts.map(a =>
     '<tr><td>' + a.student + '</td><td>' + STATUS[a.status] + '</td><td>' + fmt(a.remaining_seconds) +
     '</td><td>' + (a.score===null?'-':a.score) + '</td><td><a href="' + a.url + '">' + location.origin + a.url + '</a></td></tr>'
@@ -517,6 +642,11 @@ async function refresh(){
     '<p><b>' + (i+1) + '. ' + q.text + '</b>' +
     (q.type==='single' ? '<br>' + q.options.map((o,j)=> (j===q.answer?'✅ ':'　') + o).join('<br>') : ' <i>(简答题, 不自动判分)</i>') + '</p>'
   ).join('');
+}
+async function publishExam(){
+  if(!confirm('发布后学生即可进场, 且题目不能再修改。确认发布?')) return;
+  const r = await fetch('/api/exams/' + EXAM_ID + '/publish', {method: 'POST'});
+  if(r.ok) refresh(); else alert('发布失败');
 }
 refresh(); setInterval(refresh, 4000);
 </script></body></html>"""

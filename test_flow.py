@@ -19,7 +19,7 @@ def check(name, cond, detail=""):
     print(f"{PASS if cond else FAIL} {name}" + (f"  -- {detail}" if detail and not cond else ""))
 
 
-def make_exam(client, duration=60, students=("张三", "李四")):
+def make_exam(client, duration=60, students=("张三", "李四"), publish=True):
     r = client.post("/api/exams", json={
         "title": "9月安全培训测验",
         "duration_seconds": duration,
@@ -33,7 +33,12 @@ def make_exam(client, duration=60, students=("张三", "李四")):
         "students": list(students),
     })
     assert r.status_code == 200, r.get_json()
-    return r.get_json()
+    exam = r.get_json()
+    assert exam["status"] == "draft", "新创建的考试应为草稿"
+    if publish:
+        r = client.post(f"/api/exams/{exam['exam_id']}/publish")
+        assert r.get_json()["status"] == "published"
+    return exam
 
 
 def token_of(exam, name):
@@ -141,6 +146,45 @@ s = c.get(f"/api/s/{tok4}/state").get_json()
 check("更高 rev 保存正常生效", not r5.get("stale") and s["answers"] == {"q1": 0, "q2": 0}, str(s["answers"]))
 r6 = c.post(f"/api/s/{tok4}/answers", json={"answers": {"q1": 1}})  # 缺 rev
 check("缺少 rev 的保存被拒绝(400)", r6.status_code == 400)
+
+# ---------- 场景5: 草稿 -> 校对 -> 发布, 发布后不可改 ----------
+exam5 = make_exam(client, students=("周九",), publish=False)
+tok5 = token_of(exam5, "周九")
+c = app.test_client()
+r = c.get(f"/api/s/{tok5}/state")
+check("草稿期学生无法进场(403)", r.status_code == 403, f"{r.status_code}")
+with db() as conn:
+    st = conn.execute("SELECT status FROM attempts WHERE token=?", (tok5,)).fetchone()["status"]
+check("草稿期打开链接不会启动计时", st == "not_started", st)
+check("草稿期交卷被拒绝", c.post(f"/api/s/{tok5}/submit", json={"answers": {}}).status_code == 409)
+
+# 校对发现问题: 改题 + 加学生(草稿可改)
+r = c.put(f"/api/exams/{exam5['exam_id']}", json={
+    "title": "9月安全培训测验(校对版)", "duration_seconds": 60,
+    "questions": [{"id": "q1", "text": "1+1=?", "type": "single", "options": ["2", "3"], "answer": 0}],
+    "students": ["周九", "吴十"]})
+check("草稿可修改(改题/加学生)", r.status_code == 200 and len(r.get_json()["links"]) == 2, f"{r.status_code}")
+d = c.get(f"/api/exams/{exam5['exam_id']}").get_json()
+check("修改已生效", d["title"].endswith("(校对版)") and d["questions"][0]["text"] == "1+1=?", d["title"])
+
+r1 = c.post(f"/api/exams/{exam5['exam_id']}/publish").get_json()
+r2 = c.post(f"/api/exams/{exam5['exam_id']}/publish").get_json()
+check("发布成功且重复发布幂等", r1.get("ok") and r2.get("already"), f"{r1} {r2}")
+
+r = c.put(f"/api/exams/{exam5['exam_id']}", json={
+    "title": "被篡改", "duration_seconds": 1,
+    "questions": [{"id": "q1", "text": "被篡改", "type": "text"}], "students": ["周九"]})
+check("发布后改题被拒绝(409)", r.status_code == 409, f"{r.status_code}")
+d = c.get(f"/api/exams/{exam5['exam_id']}").get_json()
+check("题目未被悄悄改动", d["questions"][0]["text"] == "1+1=?" and d["title"].endswith("(校对版)"), d["title"])
+
+# 发布后: 进场计时/自动保存/交卷照常
+s = c.get(f"/api/s/{tok5}/state").get_json()
+check("发布后学生正常进场计时", s["status"] == "in_progress" and s["remaining_seconds"] > 0, s["status"])
+check("发布后自动保存照常",
+      c.post(f"/api/s/{tok5}/answers", json={"answers": {"q1": 0}, "rev": 1}).get_json().get("ok") is True)
+r = c.post(f"/api/s/{tok5}/submit", json={"answers": {"q1": 0}}).get_json()
+check("发布后交卷判分照常(1分)", r.get("status") == "submitted" and r.get("score") == 1, str(r))
 
 print()
 failed = [n for n, ok, _ in results if not ok]
