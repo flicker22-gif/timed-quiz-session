@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     started_at   REAL,
     deadline     REAL,
     answers      TEXT NOT NULL DEFAULT '{}',  -- JSON 对象 {题目id: 答案}
+    answers_rev  INTEGER NOT NULL DEFAULT 0,  -- 答案版本号, 只接受更大的 rev, 防止旧保存请求覆盖新答案
     score        INTEGER,
     submitted_at REAL
 );
@@ -56,6 +57,10 @@ def db():
 def init_db():
     with db() as conn:
         conn.executescript(SCHEMA)
+        # 老库补列(简单迁移)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(attempts)")]
+        if "answers_rev" not in cols:
+            conn.execute("ALTER TABLE attempts ADD COLUMN answers_rev INTEGER NOT NULL DEFAULT 0")
 
 
 def parse_body():
@@ -202,6 +207,7 @@ def student_state(token):
             status=attempt["status"],
             questions=questions,
             answers=json.loads(attempt["answers"]),
+            rev=attempt["answers_rev"],
             remaining_seconds=(
                 max(0, int(attempt["deadline"] - now))
                 if attempt["status"] == "in_progress" and attempt["deadline"]
@@ -213,11 +219,16 @@ def student_state(token):
 
 @app.post("/api/s/<token>/answers")
 def save_answers(token):
-    """自动保存。仅答题中且未超时可用; 超时后拒绝并顺带强制收卷。"""
+    """
+    自动保存。请求必须带单调递增的 rev(版本号), 服务器只接受比已存更大的 rev;
+    旧请求晚到/重发会被判为 stale 直接忽略, 不会覆盖更新的答案。
+    """
     now = time.time()
-    answers = parse_body().get("answers")
-    if not isinstance(answers, dict):
-        return jsonify(error="answers 必须是对象"), 400
+    payload = parse_body()
+    answers = payload.get("answers")
+    rev = payload.get("rev")
+    if not isinstance(answers, dict) or not isinstance(rev, int):
+        return jsonify(error="需要 answers(对象) 和 rev(整数)"), 400
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         attempt = get_attempt(conn, token)
@@ -227,11 +238,17 @@ def save_answers(token):
             exam = get_exam(conn, attempt["exam_id"])
             finalize(conn, attempt, exam, "expired", now)
             return jsonify(ok=False, status="expired"), 409
-        conn.execute(
-            "UPDATE attempts SET answers=? WHERE token=?",
-            (json.dumps(answers, ensure_ascii=False), token),
+        cur = conn.execute(
+            "UPDATE attempts SET answers=?, answers_rev=? WHERE token=? AND answers_rev < ?",
+            (json.dumps(answers, ensure_ascii=False), rev, token, rev),
         )
-        return jsonify(ok=True, remaining_seconds=max(0, int(attempt["deadline"] - now)))
+        stale = cur.rowcount == 0  # 已有 >= rev 的答案落库, 本次为过期请求
+        return jsonify(
+            ok=True,
+            stale=stale,
+            rev=max(rev, attempt["answers_rev"]),
+            remaining_seconds=max(0, int(attempt["deadline"] - now)),
+        )
 
 
 @app.post("/api/s/<token>/submit")
@@ -357,6 +374,7 @@ STUDENT_HTML = """<!doctype html>
 <script>
 const TOKEN = "__TOKEN__";
 let questions = [], answers = {}, remaining = 0, finished = false, submitting = false;
+let rev = 0;  // 答案版本号, 每次保存递增, 服务器据此丢弃晚到的旧请求
 
 function fmt(s){ s = Math.max(0, s); const m = String(Math.floor(s/60)).padStart(2,'0'); return m + ':' + String(s%60).padStart(2,'0'); }
 
@@ -366,12 +384,13 @@ async function load(){
   const s = await r.json();
   document.getElementById('title').textContent = s.title;
   questions = s.questions; answers = s.answers || {}; remaining = s.remaining_seconds;
+  rev = s.rev || 0;
   render();
   if(s.status === 'submitted' || s.status === 'expired'){ showResult(s.status, s.score); return; }
   setInterval(tick, 1000);
   setInterval(save, 5000);                 // 每 5 秒自动保存
   window.addEventListener('beforeunload', () => {   // 关闭/刷新前兜底保存
-    navigator.sendBeacon('/api/s/' + TOKEN + '/answers', JSON.stringify({answers: collect()}));
+    navigator.sendBeacon('/api/s/' + TOKEN + '/answers', JSON.stringify({answers: collect(), rev: rev + 1}));
   });
 }
 
@@ -420,13 +439,15 @@ function onChange(){
 
 async function save(){
   if(finished) return;
+  rev++;
   const r = await fetch('/api/s/' + TOKEN + '/answers', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({answers: collect()}),
+    body: JSON.stringify({answers: collect(), rev: rev}),
   });
   if(r.ok){
     const d = await r.json();
-    remaining = d.remaining_seconds;         // 以服务器剩余时间校准倒计时
+    if(d.stale) rev = Math.max(rev, d.rev);   // 服务器上有更新的进度, 本地计数跟上
+    remaining = d.remaining_seconds;          // 以服务器剩余时间校准倒计时
     document.getElementById('savestate').textContent = '已自动保存 ' + new Date().toLocaleTimeString();
   } else if(r.status === 409){
     const d = await r.json();

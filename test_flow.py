@@ -54,7 +54,7 @@ def student_flow(name, final_answers):
     assert s1["status"] == "in_progress" and s1["remaining_seconds"] > 0
     assert "answer" not in str(s1["questions"]), "正确答案不应下发给学生"
     # 2. 答一部分, 自动保存
-    c.post(f"/api/s/{tokens[name]}/answers", json={"answers": {"q1": final_answers["q1"]}})
+    c.post(f"/api/s/{tokens[name]}/answers", json={"answers": {"q1": final_answers["q1"]}, "rev": s1["rev"] + 1})
     # 3. 模拟刷新: 重新拉状态, 应带着已存答案继续
     s2 = c.get(f"/api/s/{tokens[name]}/state").get_json()
     assert s2["answers"].get("q1") == final_answers["q1"], "刷新后答案丢失"
@@ -92,12 +92,12 @@ exam2 = make_exam(client, duration=2, students=("王五",))
 tok = token_of(exam2, "王五")
 c = app.test_client()
 c.get(f"/api/s/{tok}/state")
-c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1, "q3": "没答完"}})
+c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 1, "q2": 1, "q3": "没答完"}, "rev": 1})
 time.sleep(2.5)
 s = c.get(f"/api/s/{tok}/state").get_json()
 check("超时后自动强制收卷", s["status"] == "expired", s["status"])
 check("强收用已保存答案判分(2分)", s["score"] == 2, str(s.get("score")))
-r = c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 0}})
+r = c.post(f"/api/s/{tok}/answers", json={"answers": {"q1": 0}, "rev": 2})
 check("超时后保存答案被拒绝", r.status_code == 409)
 r = c.post(f"/api/s/{tok}/submit", json={"answers": {"q1": 0, "q2": 0}})
 check("超时后补交不能改答案(幂等返回原结果)",
@@ -117,6 +117,30 @@ s = c.get(f"/api/s/{tok3}/state").get_json()
 check("之后首次打开仍能正常开考", s["status"] == "in_progress" and s["remaining_seconds"] > 0, str(s["status"]))
 r = c.post(f"/api/s/{tok3}/submit", json={"answers": {"q1": 1, "q2": 1}}).get_json()
 check("开考后正常交卷判分(2分)", r.get("status") == "submitted" and r.get("score") == 2, str(r))
+
+# ---------- 场景4: 自动保存乱序到达, 旧请求不能覆盖新答案 ----------
+exam4 = make_exam(client, students=("孙七",))
+tok4 = token_of(exam4, "孙七")
+c = app.test_client()
+s = c.get(f"/api/s/{tok4}/state").get_json()
+assert s["rev"] == 0
+save = lambda rev, ans: c.post(f"/api/s/{tok4}/answers", json={"answers": ans, "rev": rev})
+
+r1 = save(1, {"q1": 0}).get_json()                 # 先发出: 选了红色
+r2 = save(2, {"q1": 1, "q2": 1}).get_json()        # 又改了两题, 新请求先落库
+check("正常递增保存生效", r1.get("ok") and r2.get("ok") and not r2.get("stale"), f"{r1} {r2}")
+r3 = save(1, {"q1": 0}).get_json()                 # 旧请求晚到(网络乱序/重发)
+check("旧 rev 请求被判为 stale", r3.get("stale") is True, str(r3))
+s = c.get(f"/api/s/{tok4}/state").get_json()
+check("刷新后新答案未被旧请求覆盖",
+      s["answers"] == {"q1": 1, "q2": 1} and s["rev"] == 2, str(s["answers"]))
+r4 = save(2, {"q1": 0}).get_json()                 # 相同 rev 重发也不算更新
+check("相同 rev 重发被忽略", r4.get("stale") is True, str(r4))
+r5 = save(3, {"q1": 0, "q2": 0}).get_json()        # 真正更新的保存仍正常生效
+s = c.get(f"/api/s/{tok4}/state").get_json()
+check("更高 rev 保存正常生效", not r5.get("stale") and s["answers"] == {"q1": 0, "q2": 0}, str(s["answers"]))
+r6 = c.post(f"/api/s/{tok4}/answers", json={"answers": {"q1": 1}})  # 缺 rev
+check("缺少 rev 的保存被拒绝(400)", r6.status_code == 400)
 
 print()
 failed = [n for n, ok, _ in results if not ok]
