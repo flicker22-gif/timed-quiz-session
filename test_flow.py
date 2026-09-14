@@ -567,6 +567,78 @@ try:
 finally:
     app_mod.DB_PATH = orig_db
 
+# ---------- 场景10: 并发自动保存乱序到达(可重复), 刷新后必须是最新答案 ----------
+exam10 = make_exam(client, students=("乱序生",))
+tok10 = token_of(exam10, "乱序生")
+c = app.test_client()
+s = c.get(f"/api/s/{tok10}/state").get_json()
+assert s["rev"] == 0
+
+# 模拟"连续改几道题, 多个自动保存同时在飞": rev 1..6 同时发出,
+# 每个请求按 rev 倒序错开 50ms, 旧请求稳定晚到新请求之后(确定性乱序, 可重复)
+N = 6
+snapshots = {i: {"q1": i % 3, "q2": i % 2, "q3": f"第{i}次保存"} for i in range(1, N + 1)}
+responses = {}
+
+
+def delayed_save(i):
+    cc = app.test_client()
+    time.sleep((N - i) * 0.05)      # rev 越大越早到, 强制乱序
+    r = cc.post(f"/api/s/{tok10}/answers", json={"answers": snapshots[i], "rev": i})
+    responses[i] = r.get_json()
+
+
+threads = [threading.Thread(target=delayed_save, args=(i,)) for i in range(1, N + 1)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+check("并发乱序保存都返回 ok", all(responses[i].get("ok") for i in responses), str(responses))
+check("晚到的旧 rev 全部判 stale, 仅最新 rev 生效",
+      all(responses[i].get("stale") for i in range(1, N)) and responses[N].get("stale") is False,
+      str(responses))
+s = c.get(f"/api/s/{tok10}/state").get_json()
+check("刷新后是最新一次保存的答案(rev 6)",
+      s["answers"] == snapshots[N] and s["rev"] == N, str(s["answers"]))
+
+# sendBeacon(text/plain) 与 fetch 乱序: beacon 带新快照先到, 旧 fetch 晚到必须被丢弃
+r = c.post(f"/api/s/{tok10}/answers",
+           data=json.dumps({"answers": {"q1": 0, "q2": 0, "q3": "beacon最新"}, "rev": N + 1}),
+           content_type="text/plain")
+check("sendBeacon(text/plain)保存正常生效",
+      r.get_json().get("ok") and r.get_json().get("stale") is False, str(r.get_json()))
+r = c.post(f"/api/s/{tok10}/answers", json={"answers": {"q1": 2}, "rev": N})
+check("beacon之后晚到的旧fetch被丢弃", r.get_json().get("stale") is True, str(r.get_json()))
+s = c.get(f"/api/s/{tok10}/state").get_json()
+check("刷新后仍是 beacon 保存的最新答案",
+      s["answers"]["q3"] == "beacon最新" and s["rev"] == N + 1, str(s["answers"]))
+
+# rev 为布尔值按格式错误拒绝(true 在 Python 里是 int 1, 不能蒙混为合法版本号)
+r = c.post(f"/api/s/{tok10}/answers", json={"answers": {"q1": 1}, "rev": True})
+check("布尔 rev 被拒绝(400)", r.status_code == 400, f"{r.status_code}")
+
+# 已提交答卷: 更高 rev 的迟到保存也绝不能回写
+c.post(f"/api/s/{tok10}/submit", json={"answers": {"q1": 1, "q2": 1, "q3": "最终交卷"}})
+r = c.post(f"/api/s/{tok10}/answers", json={"answers": {"q1": 0, "q3": "迟到篡改"}, "rev": 999})
+check("交卷后迟到保存(更高 rev)被拒(409)", r.status_code == 409, f"{r.status_code}")
+s = c.get(f"/api/s/{tok10}/state").get_json()
+check("已提交答卷未被迟到请求回写",
+      s["status"] == "submitted" and s["answers"] == {"q1": 1, "q2": 1, "q3": "最终交卷"},
+      str(s["answers"]))
+
+# 已过期答卷: 迟到保存(更高 rev)同样不能回写, 强收用的仍是已保存答案
+exam10b = make_exam(client, duration=2, students=("过期生",))
+tok10b = token_of(exam10b, "过期生")
+cb = app.test_client()
+cb.get(f"/api/s/{tok10b}/state")
+cb.post(f"/api/s/{tok10b}/answers", json={"answers": {"q1": 1, "q2": 1, "q3": "已保存进度"}, "rev": 1})
+time.sleep(2.5)
+r = cb.post(f"/api/s/{tok10b}/answers", json={"answers": {"q1": 0, "q2": 0, "q3": "迟到篡改"}, "rev": 2})
+check("超时后迟到保存被拒(409/expired)",
+      r.status_code == 409 and r.get_json().get("status") == "expired", f"{r.status_code} {r.get_json()}")
+s = cb.get(f"/api/s/{tok10b}/state").get_json()
+check("过期答卷仍是已保存的答案, 未被回写",
+      s["answers"] == {"q1": 1, "q2": 1, "q3": "已保存进度"}, str(s["answers"]))
+
 print()
 failed = [n for n, ok, _ in results if not ok]
 print(f"共 {len(results)} 项检查, 通过 {len(results) - len(failed)}, 失败 {len(failed)}")

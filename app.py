@@ -493,7 +493,7 @@ def save_answers(token):
     payload = parse_body()
     answers = payload.get("answers")
     rev = payload.get("rev")
-    if not isinstance(answers, dict) or not isinstance(rev, int):
+    if not isinstance(answers, dict) or not isinstance(rev, int) or isinstance(rev, bool):
         return jsonify(error="需要 answers(对象) 和 rev(整数)"), 400
     with db() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -781,7 +781,9 @@ async function load(){
   setInterval(tick, 1000);
   setInterval(save, 5000);                 // 每 5 秒自动保存
   window.addEventListener('beforeunload', () => {   // 关闭/刷新前兜底保存
-    navigator.sendBeacon('/api/s/' + TOKEN + '/answers', JSON.stringify({answers: collect(), rev: rev + 1}));
+    // beacon 也必须消耗一个 rev(++rev): 若只读 rev+1, 卸载瞬间恰好启动的定时保存会撞同一版本号,
+    // 服务器对同 rev 只认先到者, 携带更新快照的一方可能被判 stale 丢弃
+    navigator.sendBeacon('/api/s/' + TOKEN + '/answers', JSON.stringify({answers: collect(), rev: ++rev}));
   });
 }
 
@@ -832,10 +834,17 @@ function onChange(){
 async function save(){
   if(finished) return;
   rev++;
-  const r = await fetch('/api/s/' + TOKEN + '/answers', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({answers: collect(), rev: rev}),
-  });
+  let r;
+  try{
+    r = await fetch('/api/s/' + TOKEN + '/answers', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({answers: collect(), rev: rev}),
+    });
+  }catch(e){
+    // 断网/超时: rev 已消耗(允许跳号, 服务端只要求递增), 下一次定时保存带完整快照重试
+    document.getElementById('savestate').textContent = '保存失败, 网络恢复后自动重试…';
+    return;
+  }
   if(r.ok){
     const d = await r.json();
     if(d.stale) rev = Math.max(rev, d.rev);   // 服务器上有更新的进度, 本地计数跟上
